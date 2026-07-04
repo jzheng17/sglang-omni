@@ -24,6 +24,49 @@ logger = logging.getLogger(__name__)
 _PEER_ENABLED: set[tuple[int, int]] = set()
 _PEER_VISIBILITY_WARNED: set[tuple[int, int, int]] = set()
 
+# Completion-wait tuning. The spin window is sized to catch the small,
+# latency-sensitive completions that dominate decode (e.g. per-frame hidden
+# states, a few microseconds over NVLink) with no added latency; larger copies
+# correctly fall through to backoff, where the added detection latency is
+# negligible next to a multi-millisecond copy and the CPU is freed meanwhile.
+# These are provisional defaults, NOT measured: they should be tuned against the
+# Phase-0 profiling (issue #907) on target hardware before being trusted.
+_WAIT_SPIN_SECONDS = 20e-6
+_WAIT_BACKOFF_MIN_SECONDS = 50e-6
+_WAIT_BACKOFF_MAX_SECONDS = 1e-3
+
+
+async def _await_ready(
+    predicate: Callable[[], bool],
+    *,
+    deadline: float,
+    loop: asyncio.AbstractEventLoop,
+    timeout_message: str,
+) -> int:
+    """Wait until ``predicate`` is true without busy-spinning.
+
+    Phase 1 spins tightly for a short bounded window so the common fast
+    completion returns with no added latency. Phase 2 falls back to exponential
+    backoff with real sleeps, so a slow or hung transfer does not keep the
+    event-loop thread (and, via cudaEventQuery, the CUDA driver) fully busy.
+    Returns the number of polls performed.
+    """
+    polls = 0
+    spin_deadline = loop.time() + _WAIT_SPIN_SECONDS
+    while loop.time() < spin_deadline:
+        if predicate():
+            return polls
+        polls += 1
+        await asyncio.sleep(0)
+    delay = _WAIT_BACKOFF_MIN_SECONDS
+    while not predicate():
+        if loop.time() > deadline:
+            raise TimeoutError(timeout_message)
+        polls += 1
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, _WAIT_BACKOFF_MAX_SECONDS)
+    return polls
+
 
 def _parse_device_id(device: str) -> int:
     if device.startswith("cuda:"):
@@ -169,12 +212,39 @@ class CudaIpcPutOperation(RelayOperation):
         wait_start = _comm_now_ns()
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
-        polls = 0
-        while not self._ack_map.is_done(self._ack_index):
-            if loop.time() > deadline:
-                raise TimeoutError("cuda_ipc receiver did not ack slot in time")
-            polls += 1
-            await asyncio.sleep(0)
+        # The spin+backoff helper below is an interim fix for the busy-spin only;
+        # the sender still polls a shared-mmap ack byte. The end-state is a truly
+        # event-driven wait, via one of two routes:
+        #   - eventfd + loop.add_reader (preferred): the receiver writes the
+        #     eventfd and the event loop wakes this coroutine directly -- zero CPU,
+        #     no helper thread, and a closed fd surfaces peer death immediately.
+        #     Cost: an eventfd is a raw fd, so it must be handed across the process
+        #     boundary (fork-inherit, or SCM_RIGHTS over a unix socket).
+        #   - named pipe (FIFO): path-based like today's ack file (no fd-passing),
+        #     and a pipe read is likewise add_reader-drivable. Slightly heavier
+        #     than eventfd and needs FIFO lifecycle management.
+        # TODO(comm): replace the shared-mmap ack poll with an eventfd + add_reader
+        # (falling back to a named pipe only if fd-passing is impractical) so the
+        # sender blocks event-driven with zero CPU and prompt peer-death detection,
+        # instead of this spin+backoff and the blunt 30s timeout.
+        try:
+            polls = await _await_ready(
+                lambda: self._ack_map.is_done(self._ack_index),
+                deadline=deadline,
+                loop=loop,
+                timeout_message="cuda_ipc receiver did not ack slot in time",
+            )
+        except TimeoutError:
+            # Release the slot even on timeout: a crashed or hung receiver must not
+            # permanently leak a credit (there are only ``credits``, default 2) and
+            # deadlock later puts. TODO(comm): a safer end-state marks the relay
+            # failed and tears it down rather than risking reuse of a slot the dead
+            # receiver might still read.
+            self._completed = True
+            self._release_cb()
+            self._source_tensor = None
+            self._ready_event = None
+            raise
         self._completed = True
         self._release_cb()
         self._source_tensor = None
@@ -219,12 +289,12 @@ class CudaIpcGetOperation(RelayOperation):
         wait_start = _comm_now_ns()
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
-        polls = 0
-        while not self._event.query():
-            if loop.time() > deadline:
-                raise TimeoutError("cuda_ipc copy did not complete in time")
-            polls += 1
-            await asyncio.sleep(0)
+        polls = await _await_ready(
+            self._event.query,
+            deadline=deadline,
+            loop=loop,
+            timeout_message="cuda_ipc copy did not complete in time",
+        )
         self._completed = True
         self._ack_map.mark_done(self._ack_index)
         self._pool_tensor = None
