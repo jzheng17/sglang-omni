@@ -191,6 +191,7 @@ class CudaIpcPutOperation(RelayOperation):
         request_id: str | None,
         size: int,
         release_cb: Callable[[], None],
+        fail_cb: Callable[[BaseException], None],
     ) -> None:
         self._metadata = metadata
         self._ready_event: torch.cuda.Event | None = ready_event
@@ -200,6 +201,7 @@ class CudaIpcPutOperation(RelayOperation):
         self._request_id = request_id
         self._size = size
         self._release_cb = release_cb
+        self._fail_cb = fail_cb
         self._completed = False
 
     @property
@@ -234,14 +236,11 @@ class CudaIpcPutOperation(RelayOperation):
                 loop=loop,
                 timeout_message="cuda_ipc receiver did not ack slot in time",
             )
-        except TimeoutError:
-            # Release the slot even on timeout: a crashed or hung receiver must not
-            # permanently leak a credit (there are only ``credits``, default 2) and
-            # deadlock later puts. TODO(comm): a safer end-state marks the relay
-            # failed and tears it down rather than risking reuse of a slot the dead
-            # receiver might still read.
+        except TimeoutError as exc:
+            # Timeout is a hard relay failure; do not return a possibly live slot
+            # to normal traffic.
             self._completed = True
-            self._release_cb()
+            self._fail_cb(exc)
             self._source_tensor = None
             self._ready_event = None
             raise
@@ -345,6 +344,8 @@ class CudaIpcRelay(Relay):
 
         self._remote_pools: dict[str, torch.Tensor] = {}
         self._remote_acks: dict[str, _AckMap] = {}
+        self._failed_error: BaseException | None = None
+        self._failed_event = asyncio.Event()
 
     def __del__(self) -> None:
         try:
@@ -410,6 +411,42 @@ class CudaIpcRelay(Relay):
             raise RuntimeError("cuda_ipc local ack map was not initialized")
         return pool_tensor, pool_id, pool_storage_handle, allocator, ack_map
 
+    def _mark_failed(self, exc: BaseException) -> None:
+        if self._failed_error is None:
+            self._failed_error = exc
+            self._failed_event.set()
+
+    def _raise_if_failed(self) -> None:
+        if self._failed_error is not None:
+            raise RuntimeError("cuda_ipc relay failed") from self._failed_error
+
+    async def _acquire_slot(self, allocator: CreditAllocator) -> int:
+        self._raise_if_failed()
+        acquire_task = asyncio.create_task(allocator.acquire_async())
+        fail_task = asyncio.create_task(self._failed_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {acquire_task, fail_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if fail_task in done:
+                if acquire_task in done:
+                    allocator.release(acquire_task.result())
+                self._raise_if_failed()
+                raise RuntimeError("cuda_ipc relay failed")
+
+            offset = acquire_task.result()
+            try:
+                self._raise_if_failed()
+            except Exception:
+                allocator.release(offset)
+                raise
+            return offset
+        finally:
+            for task in (acquire_task, fail_task):
+                if not task.done():
+                    task.cancel()
+
     def _get_remote_pool(
         self,
         metadata: dict[str, Any],
@@ -445,6 +482,7 @@ class CudaIpcRelay(Relay):
         request_id: str | None = None,
         dst_rank: int | None = None,
     ) -> CudaIpcPutOperation:
+        self._raise_if_failed()
         if not tensor.is_cuda:
             raise ValueError(
                 "cuda_ipc relay can only transfer CUDA tensors; "
@@ -466,7 +504,7 @@ class CudaIpcRelay(Relay):
             )
 
         acquire_start = _comm_now_ns()
-        offset = await allocator.acquire_async()
+        offset = await self._acquire_slot(allocator)
         acquire_ms = _comm_elapsed_ms(acquire_start)
         slot_index = int(offset // self.slot_size)
         ack_map.clear(slot_index)
@@ -526,6 +564,7 @@ class CudaIpcRelay(Relay):
             request_id=request_id,
             size=size,
             release_cb=lambda: allocator.release(offset),
+            fail_cb=self._mark_failed,
         )
 
     async def get_async(

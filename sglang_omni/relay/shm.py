@@ -114,6 +114,14 @@ class ShmPutOperation(ShmOperation):
                 else:
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, _CONSUME_BACKOFF_MAX_SECONDS)
+        except TimeoutError:
+            # Reclaim the named block before releasing credit so repeated absent
+            # consumers cannot fill /dev/shm.
+            try:
+                self._shm_obj.unlink()
+            except FileNotFoundError:
+                pass
+            raise
         finally:
             # Always release the credit, even on timeout, so an absent or crashed
             # consumer cannot permanently leak a slot.
@@ -158,7 +166,10 @@ class ShmGetOperation(ShmOperation):
             finally:
                 # 3. Cleanup (Receiver owns lifecycle)
                 existing_shm.close()
-                existing_shm.unlink()
+                try:
+                    existing_shm.unlink()
+                except FileNotFoundError:
+                    pass
 
         finally:
             self._completed = True
