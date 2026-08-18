@@ -10,6 +10,8 @@ import torch
 
 from sglang_omni.comm.data_ref import TransportKind
 from sglang_omni.platforms import current_platform
+from sglang_omni.profiler.comm_trace import emit as _comm_trace
+from sglang_omni.profiler.comm_trace import enabled as _comm_trace_enabled
 from sglang_omni.relay.base import Relay, create_relay
 
 logger = logging.getLogger(__name__)
@@ -58,6 +60,7 @@ class CommRouter:
         self.comm_config = dict(comm_config or {})
         self.injected_relay = injected_relay
         self._relays: dict[TransportKind, Relay] = {}
+        self._traced_transports: dict[tuple[str, str], TransportKind] = {}
         self._cuda_ipc_peer_cache: dict[str, bool] = {}
 
     def _cuda_ipc_peer_available(self, target: str) -> bool:
@@ -146,10 +149,39 @@ class CommRouter:
             return TransportKind.SHM
         return transport
 
+    def _note_transport(
+        self,
+        direction: str,
+        target: str,
+        kind: TransportKind,
+    ) -> TransportKind:
+        """Record the transport an edge uses, the first time and on every change.
+
+        These methods run once per transfer, so emitting every call would bury
+        the log. An edge that changes transport mid-run still reads as healthy in
+        every other counter, so record the change itself.
+        """
+        if not _comm_trace_enabled():
+            return kind
+        key = (direction, target)
+        previous = self._traced_transports.get(key)
+        if previous is kind:
+            return kind
+        self._traced_transports[key] = kind
+        _comm_trace(
+            "comm_transport_selected",
+            stage=self.stage_name,
+            direction=direction,
+            peer_stage=target,
+            transport=kind.value,
+            previous=None if previous is None else previous.value,
+        )
+        return kind
+
     def outbound(self, target: str) -> TransportKind:
         if target in self.same_process_targets:
-            return TransportKind.LOCAL_OBJECT
-        return self._physical_outbound(target)
+            return self._note_transport("outbound", target, TransportKind.LOCAL_OBJECT)
+        return self._note_transport("outbound", target, self._physical_outbound(target))
 
     def _physical_outbound(self, target: str) -> TransportKind:
         if target in self.remote_stage_names:
@@ -165,11 +197,13 @@ class CommRouter:
                 f"{type(data).__name__}"
             )
         if target in self.remote_stage_names:
-            return TransportKind.MOONCAKE
+            return self._note_transport("stream", target, TransportKind.MOONCAKE)
         if data.device.type != current_platform.device_type:
-            return TransportKind.SHM
+            return self._note_transport("stream", target, TransportKind.SHM)
         if self.self_is_gpu and target in self.gpu_stage_names:
-            return self._intra_node_transport(target)
+            return self._note_transport(
+                "stream", target, self._intra_node_transport(target)
+            )
         raise ValueError(
             f"{current_platform.device_type} stream chunk cannot be sent from "
             f"{self.stage_name!r} to non-GPU target {target!r}"
@@ -177,10 +211,12 @@ class CommRouter:
 
     def inbound(self, from_stage: str) -> TransportKind:
         if from_stage in self.remote_stage_names:
-            return TransportKind.MOONCAKE
+            return self._note_transport("inbound", from_stage, TransportKind.MOONCAKE)
         if self.self_is_gpu and from_stage in self.gpu_stage_names:
-            return current_platform.get_intra_node_transport()
-        return TransportKind.SHM
+            return self._note_transport(
+                "inbound", from_stage, current_platform.get_intra_node_transport()
+            )
+        return self._note_transport("inbound", from_stage, TransportKind.SHM)
 
     def relay(self, kind: TransportKind) -> Relay:
         if kind is TransportKind.LOCAL_OBJECT:
@@ -212,17 +248,19 @@ class CommRouter:
 
     def outbound_payload(self, target: str, payload: Any) -> TransportKind:
         if target in self.remote_stage_names:
-            return TransportKind.MOONCAKE
+            return self._note_transport("payload", target, TransportKind.MOONCAKE)
         devices = _tensor_devices(getattr(payload, "data", payload))
         if not devices or devices == {"cpu"}:
-            return TransportKind.SHM
+            return self._note_transport("payload", target, TransportKind.SHM)
         if current_platform.device_type in devices and devices <= {
             "cpu",
             current_platform.device_type,
         }:
             if self.self_is_gpu and target in self.gpu_stage_names:
-                return self._intra_node_transport(target)
-            return TransportKind.SHM
+                return self._note_transport(
+                    "payload", target, self._intra_node_transport(target)
+                )
+            return self._note_transport("payload", target, TransportKind.SHM)
         raise ValueError(f"mixed or unsupported tensor devices in payload: {devices}")
 
     def relay_for_stream(
