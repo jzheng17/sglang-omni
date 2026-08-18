@@ -336,9 +336,18 @@ class CommEngine:
         relay: Relay,
         data_ref: DataRef,
     ) -> tuple[torch.Tensor, dict[str, Any] | None]:
-        return await stage_io.read_stream_chunk(
+        read_start = _comm_now_ns()
+        data, metadata = await stage_io.read_stream_chunk(
             relay, data_ref, self.local_payload_device
         )
+        _comm_trace(
+            "comm_stream_read",
+            object_id=data_ref.object_id,
+            transport=data_ref.transport.value,
+            bytes=data.nbytes,
+            elapsed_ms=round(_comm_elapsed_ms(read_start), 6),
+        )
+        return data, metadata
 
     def register_kv_pool(self, pool: KVPool) -> None:
         self._kv_pools[pool.pool_id] = pool
@@ -946,6 +955,7 @@ class CommEngine:
                 to_stage=job.target_stage,
                 chunk_id=job.chunk_id,
                 transport=job.transport.value,
+                bytes=job.data.nbytes,
                 queue_key=queue_key,
                 queue_wait_ms=round((send_start - job.enqueued_ns) / 1_000_000.0, 6),
                 write_ms=round(write_ms, 6),
