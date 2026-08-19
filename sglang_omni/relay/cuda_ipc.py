@@ -1023,6 +1023,7 @@ class CudaIpcRelay(Relay):
         source_pool_id: str,
         source_page_indices: tuple[int, ...],
         destination_ref: dict[str, Any],
+        transfer_id: str | None = None,
     ) -> _ReceiverAckOperation:
         pool = self._kv_pools.get(source_pool_id)
         if pool is None:
@@ -1050,6 +1051,7 @@ class CudaIpcRelay(Relay):
         relay_info["cuda_ipc_kv"]["ready_event"] = ready_event.ipc_handle()
         _comm_trace(
             "cuda_ipc_kv_put",
+            transfer_id=transfer_id,
             source_pool_id=source_pool_id,
             num_pages=len(source_page_indices),
             bytes=relay_info["transfer_info"]["size"],
@@ -1071,6 +1073,7 @@ class CudaIpcRelay(Relay):
         source_page_indices: tuple[int, ...],
         destination_page_indices: tuple[int, ...],
         request_id: str,
+        transfer_id: str | None = None,
     ) -> CudaIpcGetOperation:
         destination = self._kv_pools.get(destination_pool_id)
         if destination is None:
@@ -1090,6 +1093,7 @@ class CudaIpcRelay(Relay):
             ):
                 _comm_trace(
                     "cuda_ipc_kv_peer_access_denied",
+                    transfer_id=transfer_id,
                     request_id=request_id,
                     source_device_id=source_device_id,
                     destination_device_id=destination_device_id,
@@ -1161,6 +1165,7 @@ class CudaIpcRelay(Relay):
         )
         _comm_trace(
             "cuda_ipc_kv_get",
+            transfer_id=transfer_id,
             request_id=request_id,
             destination_pool_id=destination_pool_id,
             num_pages=len(source_page_indices),

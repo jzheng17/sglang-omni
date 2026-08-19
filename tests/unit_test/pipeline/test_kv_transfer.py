@@ -65,8 +65,9 @@ class _PagedRelay(FakeRelay):
         source_pool_id: str,
         source_page_indices: tuple[int, ...],
         destination_ref: dict[str, Any],
+        transfer_id: str | None = None,
     ) -> FakeOp:
-        del source_pool_id, destination_ref
+        del source_pool_id, destination_ref, transfer_id
         op = FakeOp(
             {
                 "transfer_info": {"size": len(source_page_indices)},
@@ -87,6 +88,7 @@ class _PagedRelay(FakeRelay):
         source_page_indices: tuple[int, ...],
         destination_page_indices: tuple[int, ...],
         request_id: str,
+        transfer_id: str | None = None,
     ) -> FakeOp:
         assert metadata["fake_kv"] is True
         self.received_source_tp_ranks.append(metadata["source_tp_rank"])
@@ -161,6 +163,7 @@ class _BlockingPagedRelay(_PagedRelay):
         source_page_indices: tuple[int, ...],
         destination_page_indices: tuple[int, ...],
         request_id: str,
+        transfer_id: str | None = None,
     ) -> FakeOp:
         del metadata
         self.get_calls.append(

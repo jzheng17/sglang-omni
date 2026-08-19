@@ -344,7 +344,7 @@ class CommEngine:
             "comm_stream_read",
             object_id=data_ref.object_id,
             transport=data_ref.transport.value,
-            bytes=data.nbytes,
+            bytes=data_ref.buffer.length,
             elapsed_ms=round(_comm_elapsed_ms(read_start), 6),
         )
         return data, metadata
@@ -446,6 +446,7 @@ class CommEngine:
                 source_pool_id=source_pool_id,
                 source_page_indices=source_page_indices,
                 destination_ref=ready.destination_ref,
+                transfer_id=transfer_id,
             )
             data_ref = DataRef(
                 version=1,
@@ -678,6 +679,7 @@ class CommEngine:
                 source_page_indices=state.request.source_page_indices,
                 destination_page_indices=state.destination.page_indices,
                 request_id=request_id,
+                transfer_id=data_ref.object_id,
             )
             await op.wait_for_completion(timeout=self._ack_timeout_s)
             if state.abort_error is not None:
@@ -690,19 +692,7 @@ class CommEngine:
                 num_pages=len(state.destination.page_indices),
                 elapsed_ms=round(_comm_elapsed_ms(read_start), 6),
             )
-        except asyncio.CancelledError as exc:
-            _comm_trace(
-                "comm_kv_read_failed",
-                transfer_id=data_ref.object_id,
-                request_id=request_id,
-                error=type(exc).__name__,
-                detail=exc,
-                elapsed_ms=round(_comm_elapsed_ms(read_start), 6),
-            )
-            with suppress(Exception):
-                state.receiver.abort(state.request, state.destination, exc)
-            raise
-        except Exception as exc:
+        except (asyncio.CancelledError, Exception) as exc:
             _comm_trace(
                 "comm_kv_read_failed",
                 transfer_id=data_ref.object_id,
