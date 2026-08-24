@@ -103,10 +103,11 @@ def test_no_override_leaves_the_pipeline_untouched(tmp_path) -> None:
         assert all(s.pd_execution is None for s in prep.stages_cfg)
 
 
-def test_same_gpu_is_rejected_by_schema_validation(tmp_path) -> None:
+def test_same_gpu_from_the_flag_needs_a_token_budget(tmp_path) -> None:
     # model_copy does not re-enter model_post_init, so the override must re-run
     # _validate_pd itself; without that this placement would reach expansion.
-    with pytest.raises(ValueError, match="cannot share the same GPU"):
+    # The flag carries placement only, so a shared card has no budget yet.
+    with pytest.raises(ValueError, match="max_total_tokens"):
         apply_pd_stage_overrides(_pipeline(tmp_path), pd_stages=["thinker=1:1"])
 
 

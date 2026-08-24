@@ -639,11 +639,27 @@ class PipelineConfig(BaseModel):
                     f"Stage {s.name!r} pd_disaggregation requires explicit "
                     "prefill.gpu and decode.gpu for real PD"
                 )
-            if _pd_gpu_set(p_gpu) & _pd_gpu_set(d_gpu):
-                raise ValueError(
-                    f"Stage {s.name!r} pd_disaggregation prefill and decode "
-                    "cannot share the same GPU"
-                )
+            # Note (Audrey Zheng): The halves may share a GPU, but then each
+            # needs an absolute KV budget rather than a fraction. The two
+            # halves race for the same startup lock and the winner varies
+            # between runs, so the second one to load sees a different amount
+            # of free memory than the first. `mem_fraction_static` is computed
+            # against what is free at load time, which makes it order
+            # dependent: measured on one H200, whichever half loaded first
+            # took 780,987 KV tokens and the other failed to start. An
+            # explicit `max_total_tokens` is order independent because
+            # `_apply_token_constraints` takes the smaller of the two.
+            shared = _pd_gpu_set(p_gpu) & _pd_gpu_set(d_gpu)
+            if shared:
+                for role, half in (("prefill", pd.prefill), ("decode", pd.decode)):
+                    if "max_total_tokens" not in half.server_args:
+                        raise ValueError(
+                            f"Stage {s.name!r} places prefill and decode on "
+                            f"shared GPU(s) {sorted(shared)}, which requires an "
+                            f"explicit {role}.server_args['max_total_tokens']; "
+                            "mem_fraction_static alone is not order-safe when "
+                            "two halves size their pools from one card"
+                        )
             for role, gpu in (("prefill", p_gpu), ("decode", d_gpu)):
                 if isinstance(gpu, list) and len(gpu) != s.tp_size:
                     raise ValueError(
@@ -682,12 +698,6 @@ def _target_list(targets: str | list[str] | None) -> list[str]:
     return list(targets)
 
 
-def _pd_gpu_set(gpu: int | list[int]) -> set[int]:
-    if isinstance(gpu, int):
-        return {gpu}
-    return {int(gpu_id) for gpu_id in gpu}
-
-
 def _stage_gpu_ids_for_fusion(stage: StageConfig) -> tuple[int, ...]:
     gpu = stage.gpu
     if gpu is None:
@@ -695,3 +705,8 @@ def _stage_gpu_ids_for_fusion(stage: StageConfig) -> tuple[int, ...]:
     if isinstance(gpu, int):
         return (gpu,)
     return tuple(int(gpu_id) for gpu_id in gpu)
+
+
+def _pd_gpu_set(gpu: int | list[int]) -> set[int]:
+    """GPU indices one PD half occupies."""
+    return set(gpu) if isinstance(gpu, list) else {gpu}

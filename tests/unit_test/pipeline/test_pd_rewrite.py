@@ -225,7 +225,7 @@ def test_pd_source_and_destination_use_opposite_identities() -> None:
     [
         (
             {"terminal": True, "pd_disaggregation": _pd(0, 0)},
-            "cannot share the same GPU",
+            "max_total_tokens",
         ),
         (
             {
