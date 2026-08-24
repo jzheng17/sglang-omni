@@ -73,8 +73,20 @@ _PROMPT_HEAD = [
     "one is the wrong choice.",
 ]
 
-# ~1 token per word for this filler; the measured prompt_tokens from usage is
-# what gets reported, so the approximation only affects arm spacing.
+# `--prompt-tokens` is a target, not a count. Each repetition adds a counter
+# prefix and many filler words take more than one token, so the request
+# overshoots the flag, and the overshoot grows with the value. Measured against
+# the Qwen3-Omni tokenizer: 42 gives 42, 1150 gives about 1966, 4400 gives about
+# 7645, 2000 gives 2975, and 8000 gives 12075. Calibrate before choosing arms,
+# and check the target against the model's context limit: 8192 for Qwen3-Omni
+# thinker, which 4400 reaches once 128 output tokens are added.
+#
+# The nonce also shifts the count, because it sits inside the marker and inside
+# every counter. Let the client generate it rather than passing a `--nonce` of
+# a different width, or the arms move relative to each other.
+#
+# `prompt_tokens` reported in the result JSON is the measured value from usage
+# and is what should be quoted.
 _FILLER = (
     "The scheduler admits a request, builds its batch, runs one forward pass, "
     "and then releases the slot back to the pool for the next arrival. "

@@ -210,5 +210,14 @@ Multimodal runs need a large image pool with disjoint per-invocation offsets:
 replaying one image set dropped TTFT p95 from 882 ms to 482 ms at the same prompt
 length.
 
+`--prompt-tokens` is a target rather than a count, and it overshoots by a factor
+that grows with the value: 42 gives 42, 1150 gives about 1966, and 4400 gives
+about 7645. Quote the `prompt_tokens` recorded in the result JSON, which is the
+measured value. Check the target against the model's context limit before
+choosing arms; Qwen3-Omni thinker allows 8192, which 4400 prompt tokens reaches
+once 128 output tokens are added. Let the client generate the nonce rather than
+passing `--nonce`, because the nonce sits inside every repetition counter and a
+different width shifts the prompt length.
+
 `analyze_thinker_events` accepts events from `thinker`, `thinker_prefill` and
 `thinker_decode`, so one code path covers both arms.
