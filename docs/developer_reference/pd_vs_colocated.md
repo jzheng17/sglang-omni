@@ -197,22 +197,35 @@ that varies each independently.
 
 ## Admission rate lags
 
-| Arm | Rate per server | total_s p50 | In flight | Refused |
-| --- | --- | --- | --- | --- |
-| C, offered 32 | 15.41 | 4.24 s | 65 | 0 |
-| C, offered 44 | 19.66 | 7.95 s | 156 | 0 |
-| PD, offered 16 | 10.59 | 40.96 s | 434 | 0 |
-| PD, offered 24 | 10.55 | 68.81 s | 726 | 441 |
-| PD, offered 44 | 10.54 | 74.12 s | 781 | 2207 |
+| Arm | Rate per server | total_s p50 | In flight |
+| --- | --- | --- | --- |
+| C, offered 32 | 15.41 | 4.24 s | 65 |
+| C, offered 44 | 19.66 | 7.95 s | 156 |
+| PD, offered 16 | 10.59 | 40.96 s | 434 |
+| PD, offered 24 | 10.55 | 68.81 s | 726 |
+| PD, offered 44 | 10.54 | 74.12 s | 781 |
 
-In flight is achieved rate times median total time. Refusals begin between 434
-and 726 concurrent connections. `_request_build_backlog_limit` is None unless
-`server_args.max_queued_requests` is set, which it was not, so these refusals
-happen at the socket layer rather than as a scheduling decision.
+In flight is achieved rate times median total time. At offered 16 PD admits
+every request while each takes 41 s against colocated's 2.3 s. Admission rate
+reports a healthy system there. In-flight count and total time report the real
+state, and they should be read together.
 
-At offered 16 PD admits every request while each takes 41 s against colocated's
-2.3 s. Admission rate reports a healthy system there. In-flight count and total
-time report the real state, and they should be read together.
+The connection failures this sweep recorded above offered 16 were **client-side
+descriptor exhaustion, not the server shedding load**. The client holds one
+socket per in-flight request and ran with an unlimited connector under a 1024
+soft limit, so a saturated arm exhausts descriptors. Every such record reads
+`ClientConnectorError ... [Too many open files]`, which is EMFILE from the
+client's own `socket()` call; `[Connect call failed]`, which is what a refusing
+server produces, appears nowhere in the results. The colocated arm ran two
+client processes with a budget each and never approached the limit, so the two
+arms were not comparable on that axis at all. Treat admission rate above
+offered 16 in this sweep as a property of the harness.
+
+The harness now raises the descriptor limit and caps the connector, so a client
+at its ceiling queues rather than failing. Throughput and latency figures are
+unaffected: `achieved_rate_rps` counts completions over wall time, and the
+41-second `total_s` at offered 16 was measured where there were no failures at
+all.
 
 ## Reproducing
 

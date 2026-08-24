@@ -409,6 +409,22 @@ async def _warmup(session, args) -> None:
         await _one_request(session, args, "warmup", _make_prompt(-1 - _, args.prompt_tokens, args.nonce))
 
 
+def _raise_descriptor_limit() -> None:
+    """Raise the open-file soft limit toward its hard limit, and say so."""
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft >= hard:
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    except (ValueError, OSError) as exc:
+        print(f"could not raise RLIMIT_NOFILE from {soft}: {exc}", flush=True)
+        return
+    print(f"raised RLIMIT_NOFILE {soft} -> {hard}", flush=True)
+
+
+
 async def _resolve_model(session, args) -> str:
     if args.model:
         return args.model
@@ -422,7 +438,14 @@ async def _resolve_model(session, args) -> str:
 
 async def main_async(args) -> int:
     rng = random.Random(args.seed)
-    connector = aiohttp.TCPConnector(limit=0)
+    # An open-loop client holds one socket per in-flight request, so in-flight
+    # count is a socket count. With an unlimited connector and the usual 1024
+    # soft descriptor limit, a saturated arm exhausts descriptors and aiohttp
+    # reports `ClientConnectorError ... [Too many open files]` -- which reads
+    # like the server refusing, and is not. Raise the limit first, then cap the
+    # connector below it so the client queues instead of failing.
+    _raise_descriptor_limit()
+    connector = aiohttp.TCPConnector(limit=args.max_connections)
     payload: dict[str, Any] = {
         "config": {
             "base_url": args.base_url,
@@ -530,6 +553,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--timeout-s", type=float, default=600.0)
     parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument(
+        "--max-connections",
+        type=int,
+        default=4096,
+        help=(
+            "cap on simultaneous connections. The client queues above this "
+            "instead of exhausting descriptors and reporting a connection "
+            "error that looks like the server refusing."
+        ),
+    )
     parser.add_argument("--prompt-tokens", type=int, default=32)
     parser.add_argument("--nonce", default=None, help="prefix marker making prompts unique across runs")
     parser.add_argument("--image-path", default=None)
