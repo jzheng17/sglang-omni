@@ -148,9 +148,33 @@ Admission is not the constraint and prefill did not get slower. The whole
 difference is the decode tail. Utilization at the same offered rate is 10.1%
 mean on PD's prefill card against 67.9% on a colocated card.
 
-A 58 ms first forward against a 2.2 s decode tail makes prefill about 2.6% of a
-request's GPU work. A 1P:1D pair splits hardware 50/50 against that split, which
-predicts roughly 10% utilization on the prefill card, which is what was measured.
+A 58 ms first forward against a 2.2 s decode tail puts prefill at **at most**
+2.6% of a request's GPU work, and below that whenever a prefill step carries more
+than one request, which it does under load. A 1P:1D pair splits hardware 50/50
+against that split, which predicts roughly 10% utilization on the prefill card,
+which is what was measured.
+
+Prefill steps batch, and the batch factor grows with load: at 42 prompt tokens
+and 128 output tokens a step carries 1.19 requests at the lowest rate swept and
+5.81 at the highest, while the step itself stays between 59 ms and 66 ms across a
+14x range of batch size. The step cost model is therefore a cost per step, not
+per request, and `1 / 0.059` bounds prefill **steps** per second rather than
+requests per second.
+
+That distinction decides which resource binds. Prefill duty cycle, meaning steps
+times step cost over wall time, on one colocated replica:
+
+| Offered | 8 output tokens | 128 output tokens |
+| --- | --- | --- |
+| 8 | 24.8% | 19.2% |
+| 20 | 53.3% | 34.9% |
+| 36 | 72.3% | 32.9% |
+| 56 | 81.6% | 24.0% |
+
+At 8 output tokens the prefill path climbs toward saturation and is the binding
+constraint. At 128 it peaks near 35% and falls back as the system saturates,
+because prefill admission is throttled behind decode. The colocated ceiling
+reported above is decode-bound, not prefill-bound.
 
 By Little's law PD holds about 437 requests in the decode tail against
 `max_running_requests=64`, so most of that tail is queueing rather than decoding.
