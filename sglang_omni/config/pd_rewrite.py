@@ -156,7 +156,11 @@ def _split_pd_stage(
             "stream_to": [inbound_rename.get(t, t) for t in s.stream_to],
             "pd_disaggregation": None,
             # Note (Yue Yin): Keep compiler metadata out of user factory kwargs.
-            "pd_execution": PDExecution(role="prefill", partner=decode_name),
+            "pd_execution": PDExecution(
+                role="prefill",
+                partner=decode_name,
+                decode_targets=(decode_name,),
+            ),
         },
     )
 

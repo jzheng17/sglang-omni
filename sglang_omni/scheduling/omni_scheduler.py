@@ -546,6 +546,7 @@ class OmniScheduler:
         self._prefill_end_done: set[str] = set()
         self._pd_role: str | None = None
         self._pd_partner: str | None = None
+        self._pd_decode_targets: tuple[str, ...] = ()
         self._pd_pool_id: str | None = None
         self._pd_ready_queue = _queue_mod.Queue()
         self._pd_deferred_admission: PDDecodeAdmission | None = None
@@ -559,6 +560,7 @@ class OmniScheduler:
         stage_name: str,
         role: str,
         partner: str,
+        decode_targets: tuple[str, ...] = (),
     ) -> tuple[Any, Any | None]:
         if self.tp_size != 1:
             raise NotImplementedError("PR3 PD runtime supports tp_size == 1 only")
@@ -571,6 +573,7 @@ class OmniScheduler:
 
         self._pd_role = role
         self._pd_partner = partner
+        self._pd_decode_targets = tuple(decode_targets) or (partner,)
         self._pd_pool_id = f"{stage_name}:kv"
         raw_pool = self.token_to_kv_pool_allocator.get_kvcache()
         layout_id = (
@@ -718,6 +721,7 @@ class OmniScheduler:
                     seq_len=len(req.origin_input_ids),
                     page_size=self.page_size,
                 )
+                decode_stage = self._resolve_decode_stage(req)
                 self.outbox.put(
                     OutgoingMessage(
                         request_id=req.rid,
@@ -725,9 +729,9 @@ class OmniScheduler:
                         data=PDPrefillHandoff(
                             continuation=continuation,
                             source_pool_id=self._pd_pool_id,
-                            target_pool_id=f"{self._pd_partner}:kv",
+                            target_pool_id=f"{decode_stage}:kv",
                             source_page_indices=pages,
-                            to_stage=self._pd_partner,
+                            to_stage=decode_stage,
                             lease=SGLangKVPageLease(req, self.tree_cache),
                         ),
                     )
@@ -736,6 +740,19 @@ class OmniScheduler:
                 self._release_request_kv_cache(req)
                 self._emit_request_error(req.rid, exc)
         batch.reqs = retained
+
+    def _resolve_decode_stage(self, req: Any) -> str:
+        """Return the Decode stage that receives this request's KV.
+
+        One candidate today, so the result never varies. The call is per
+        request rather than per stage, so adding Decode workers changes a
+        policy here instead of the handoff send path.
+        """
+        del req
+        # __getattr__ delegates unknown names upstream, so read the dict
+        # directly and fall back to the single partner a caller may have set.
+        targets = self.__dict__.get("_pd_decode_targets") or ()
+        return targets[0] if targets else self._pd_partner
 
     def bind_model_runner(self, model_runner: Any) -> None:
         """Attach a custom runner and its SGLang execution-contract bridge.

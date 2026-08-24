@@ -159,6 +159,11 @@ class PDExecution(BaseModel):
 
     role: Literal["prefill", "decode"]
     partner: str
+    # Note (Audrey Zheng): the Decode halves this Prefill may hand off to. One
+    # entry today. Carrying a sequence means a second Decode worker does not
+    # migrate this schema, and the choice can move to admission time without
+    # touching the handoff send path.
+    decode_targets: tuple[str, ...] = ()
 
 
 class StageConfig(BaseModel):
