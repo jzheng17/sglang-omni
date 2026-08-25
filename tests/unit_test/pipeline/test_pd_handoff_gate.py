@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import asyncio
 from sglang_omni.config.schema import PDConfig, PDExecution
-from sglang_omni.pipeline.stage.runtime import StageRuntime
+from sglang_omni.pipeline.stage.runtime import Stage
 from tests.unit_test.pipeline.helpers import stage
 
 
-def _runtime(limit: int | None) -> StageRuntime:
-    runtime = StageRuntime.__new__(StageRuntime)
+def _runtime(limit: int | None) -> Stage:
+    runtime = Stage.__new__(Stage)
     runtime.pd_execution = PDExecution(
         role="prefill", partner="thinker_decode", max_inflight_handoffs=limit
     )
