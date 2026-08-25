@@ -548,6 +548,7 @@ class CudaIpcRelay(Relay):
         credits: int | None = 2,
         slot_size_kb: int = 64,
         pool_size_mb: int | None = None,
+        preallocate_pool: bool = False,
         **kwargs: Any,
     ) -> None:
         if kwargs:
@@ -555,6 +556,15 @@ class CudaIpcRelay(Relay):
                 f"unexpected cuda_ipc relay options: {', '.join(sorted(kwargs))}"
             )
         self.engine_id = engine_id
+        # Note (Audrey Zheng): the pool is allocated on the first payload that
+        # crosses a process boundary, not at startup, so a deployment can pass
+        # startup and still be a gigabyte short when the first multimodal
+        # request arrives. Measured on a PD pair: `mem_fraction_static=0.87`
+        # launched cleanly and then failed a 750 MiB allocation 19 minutes in,
+        # when the image arm began and `mm_aggregate` first relayed a CUDA
+        # tensor. Preallocating moves that failure to launch, where it is
+        # readable. Default off so no existing deployment changes size.
+        self._preallocate_pool = preallocate_pool
         if device == "cpu":
             raise ValueError(
                 "cuda_ipc relay requires a CUDA device; got 'cpu'. Use the shm "
@@ -577,7 +587,6 @@ class CudaIpcRelay(Relay):
             raise ValueError("cuda_ipc pool_size_mb must be positive")
         if self.slot_count <= 0:
             raise ValueError("cuda_ipc pool size must fit at least one slot")
-
         self._pool_tensor: torch.Tensor | None = None
         self._pool_id: str | None = None
         self._pool_storage_handles: dict[str, dict[str, Any]] = {}
@@ -596,6 +605,10 @@ class CudaIpcRelay(Relay):
             max_workers=_event_wait_threads_from_env(),
             thread_name_prefix=f"cuda-ipc-wait-{engine_id}",
         )
+        if self._preallocate_pool:
+            # Allocate now so a budget that cannot hold the pool fails at
+            # launch rather than on the first payload that crosses.
+            self._ensure_local_pool()
 
     def __del__(self) -> None:
         try:
