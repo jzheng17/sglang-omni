@@ -23,6 +23,7 @@ class PrefillManager:
         enable_overlap,
     ):
         self.page_size = page_size
+        self._chunking_disabled_last = False
         self.chunked_prefill_size = chunked_prefill_size
         self.max_prefill_tokens = max_prefill_tokens
         self.req_to_token_pool = req_to_token_pool
@@ -39,6 +40,32 @@ class PrefillManager:
     def add_one_request(self, req):
         # TODO(ocs884): whether to use the Req cls from sglang
         self.waiting_queue.append(req)
+
+    def _log_chunking_transition(self, disable_chunking: bool) -> None:
+        """Log when chunking turns off or back on, not while it stays off.
+
+        This is reached on every scheduling call, and `disable_chunking` stays
+        true for as long as any projected-multimodal request sits in the
+        queue, so logging the state emits one line per scheduler iteration for
+        the whole time an image workload runs. The event worth reading is the
+        transition.
+        """
+        if disable_chunking == self._chunking_disabled_last:
+            return
+        self._chunking_disabled_last = disable_chunking
+        if disable_chunking:
+            logger.info(
+                "Disable chunked prefill for projected input-embeds "
+                "request(s): chunked_req=%s waiting=%s",
+                None if self.chunked_req is None else self.chunked_req.rid,
+                [
+                    req.rid
+                    for req in self.waiting_queue
+                    if self._needs_full_prefill(req)
+                ],
+            )
+        else:
+            logger.info("Re-enable chunked prefill: no projected embeds queued")
 
     @staticmethod
     def _needs_full_prefill(req: Req | None) -> bool:
@@ -63,17 +90,7 @@ class PrefillManager:
         disable_chunking = self._needs_full_prefill(self.chunked_req) or any(
             self._needs_full_prefill(req) for req in self.waiting_queue
         )
-        if disable_chunking:
-            logger.info(
-                "Disable chunked prefill for projected input-embeds request(s): "
-                "chunked_req=%s waiting=%s",
-                None if self.chunked_req is None else self.chunked_req.rid,
-                [
-                    req.rid
-                    for req in self.waiting_queue
-                    if self._needs_full_prefill(req)
-                ],
-            )
+        self._log_chunking_transition(disable_chunking)
 
         adder = PrefillAdder(
             page_size=self.page_size,
