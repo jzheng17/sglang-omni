@@ -66,6 +66,7 @@ from sglang_omni.scheduling.pd_continuation import (
     ContinuationAwareKVReceiver,
     PDHandoffController,
 )
+from sglang_omni.scheduling.pd_decode_selection import select_decode_stage
 from sglang_omni.scheduling.pd_kv_adapter import (
     AllocatorKVReceiver,
     SGLangKVPageLease,
@@ -744,15 +745,18 @@ class OmniScheduler:
     def _resolve_decode_stage(self, req: Any) -> str:
         """Return the Decode stage that receives this request's KV.
 
-        One candidate today, so the result never varies. The call is per
-        request rather than per stage, so adding Decode workers changes a
-        policy here instead of the handoff send path.
+        The choice itself lives in `select_decode_stage`, which takes only
+        values every Prefill rank sees identically. That constraint is not
+        cosmetic: the KV send is rank-addressed, so ranks that disagree scatter
+        one request's shards across Decode halves. Read that function before
+        changing the policy.
         """
-        del req
         # __getattr__ delegates unknown names upstream, so read the dict
         # directly and fall back to the single partner a caller may have set.
         targets = self.__dict__.get("_pd_decode_targets") or ()
-        return targets[0] if targets else self._pd_partner
+        if not targets:
+            return self._pd_partner
+        return select_decode_stage(targets, str(getattr(req, "rid", "")))
 
     def bind_model_runner(self, model_runner: Any) -> None:
         """Attach a custom runner and its SGLang execution-contract bridge.
