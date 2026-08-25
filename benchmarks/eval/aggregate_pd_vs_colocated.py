@@ -10,6 +10,7 @@ whether a prefill was in flight in the SAME event stream. Pooling two replicas'
 events into one directory would let a prefill on replica 1 mark a decode gap on
 replica 2 as disturbed, which is a different GPU and no interference at all.
 """
+
 from __future__ import annotations
 
 import argparse
