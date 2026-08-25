@@ -278,7 +278,10 @@ def _next_image() -> str:
 
 def _image_pool_used() -> int:
     return _IMAGE_CURSOR
+
+
 # -----------------------------------------------------------------------------
+
 
 def _build_payload(args, prompt: str) -> dict[str, Any]:
     content: Any = prompt
@@ -398,15 +401,18 @@ async def _run_closed(session, args, concurrency: int) -> ArmResult:
                 session, args, arm, _make_prompt(idx, args.prompt_tokens, args.nonce)
             )
 
-    result.records = list(
-        await asyncio.gather(*(guarded(i) for i in range(total)))
-    )
+    result.records = list(await asyncio.gather(*(guarded(i) for i in range(total))))
     return result
 
 
 async def _warmup(session, args) -> None:
     for _ in range(args.warmup):
-        await _one_request(session, args, "warmup", _make_prompt(-1 - _, args.prompt_tokens, args.nonce))
+        await _one_request(
+            session,
+            args,
+            "warmup",
+            _make_prompt(-1 - _, args.prompt_tokens, args.nonce),
+        )
 
 
 def _raise_descriptor_limit() -> None:
@@ -422,7 +428,6 @@ def _raise_descriptor_limit() -> None:
         print(f"could not raise RLIMIT_NOFILE from {soft}: {exc}", flush=True)
         return
     print(f"raised RLIMIT_NOFILE {soft} -> {hard}", flush=True)
-
 
 
 async def _resolve_model(session, args) -> str:
@@ -484,7 +489,9 @@ async def main_async(args) -> int:
 
         for target in targets:
             for repeat in range(args.repeats):
-                run_id = f"thinker-{args.mode}-{target:g}-p{args.prompt_tokens}-r{repeat}"
+                run_id = (
+                    f"thinker-{args.mode}-{target:g}-p{args.prompt_tokens}-r{repeat}"
+                )
                 event_dir = None
                 if args.profile_events:
                     event_dir = os.path.join(args.profile_event_dir, run_id)
@@ -564,12 +571,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--prompt-tokens", type=int, default=32)
-    parser.add_argument("--nonce", default=None, help="prefix marker making prompts unique across runs")
+    parser.add_argument(
+        "--nonce", default=None, help="prefix marker making prompts unique across runs"
+    )
     parser.add_argument("--image-path", default=None)
-    parser.add_argument("--image-dir", default=None,
-                        help="draw a distinct image per request from this pool")
-    parser.add_argument("--image-offset", type=int, default=0,
-                        help="start index into the pool; keep disjoint per server")
+    parser.add_argument(
+        "--image-dir",
+        default=None,
+        help="draw a distinct image per request from this pool",
+    )
+    parser.add_argument(
+        "--image-offset",
+        type=int,
+        default=0,
+        help="start index into the pool; keep disjoint per server",
+    )
     parser.add_argument("--profile-events", action="store_true")
     parser.add_argument("--profile-event-dir", default="/tmp/thinker_profile")
     parser.add_argument("--sample-util", action="store_true")

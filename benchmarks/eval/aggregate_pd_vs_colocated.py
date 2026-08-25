@@ -206,9 +206,7 @@ def main() -> int:
     print("-" * len(hdr))
     for wl in ("text", "image"):
         for arm in ("Ca", "Cb", "PD"):
-            rows = sorted(
-                (k, v) for k, v in agg.items() if k[0] == arm and k[1] == wl
-            )
+            rows = sorted((k, v) for k, v in agg.items() if k[0] == arm and k[1] == wl)
             for (a, w, rate), v in rows:
                 print(
                     f"{a:<5}{w:<8}{rate:>8.4g}{fmt(v['achieved_rps'], 2):>9}"
