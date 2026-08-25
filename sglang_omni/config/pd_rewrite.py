@@ -16,6 +16,15 @@ from dataclasses import dataclass
 
 from sglang_omni.config.schema import PDExecution, StageConfig
 
+# Note (Audrey Zheng): bind_pd_runtime refuses anything else, so the compiler
+# supplies these rather than letting a config compile and then fail at bind
+# time. models/ming_tts/engine_builder.py forces disable_radix_cache the same
+# way, with an explicit reason.
+PD_REQUIRED_SERVER_ARGS: dict[str, object] = {
+    "disable_radix_cache": True,
+    "page_size": 1,
+}
+
 PREFILL_SUFFIX = "_prefill"
 DECODE_SUFFIX = "_decode"
 
@@ -122,6 +131,62 @@ def _rewrite_refs(
     )
 
 
+
+def pd_required_factory_args(
+    stage_name: str,
+    factory_args: dict[str, object],
+) -> dict[str, object]:
+    """Return *factory_args* with the server args PD needs already set.
+
+    A user value that contradicts one of them is rejected here, because the
+    request cannot be honoured and failing at bind time would report it as a
+    runtime error instead of a configuration error.
+    """
+    overrides = dict(factory_args.get("server_args_overrides") or {})
+    for key, required in PD_REQUIRED_SERVER_ARGS.items():
+        current = overrides.get(key)
+        if current is not None and current != required:
+            raise ValueError(
+                f"Stage {stage_name!r} is PD-disaggregated, which requires "
+                f"{key}={required!r}, but server_args_overrides sets "
+                f"{key}={current!r}"
+            )
+        overrides[key] = required
+    return {**factory_args, "server_args_overrides": overrides}
+
+
+def _half_factory_args(
+    stage: StageConfig,
+    half_server_args: dict[str, object],
+) -> dict[str, object]:
+    """Merge one half's server args into that half's factory args.
+
+    The half's values win over the stage's, because they were written for this
+    half specifically. ``pd_required_factory_args`` runs later and still rejects
+    a value that contradicts what PD requires.
+    """
+    if not half_server_args:
+        return stage.factory_args
+    overrides = {
+        **(stage.factory_args.get("server_args_overrides") or {}),
+        **half_server_args,
+    }
+    return {**stage.factory_args, "server_args_overrides": overrides}
+def _half_runtime(stage: StageConfig, memory_fraction: float | None):
+    """Route one half's share of the card into the existing per-stage budget.
+
+    ``runtime.resources.total_gpu_memory_fraction`` is already a fraction of
+    total physical GPU memory, which is what makes it order independent. This
+    only gives the two halves a way to declare different shares of it.
+    """
+    if memory_fraction is None:
+        return stage.runtime
+    resources = stage.runtime.resources.model_copy(
+        update={"total_gpu_memory_fraction": memory_fraction}
+    )
+    return stage.runtime.model_copy(update={"resources": resources})
+
+
 def _split_pd_stage(
     s: StageConfig,
     inbound_rename: dict[str, str],
@@ -138,6 +203,8 @@ def _split_pd_stage(
             "name": prefill_name,
             "gpu": pd.prefill.gpu if pd.prefill.gpu is not None else s.gpu,
             "process": pd.prefill.process or prefill_name,
+            "factory_args": _half_factory_args(s, pd.prefill.server_args),
+            "runtime": _half_runtime(s, pd.prefill.memory_fraction),
             # Note (Yue Yin): Preserve the result path when the first sampled
             # token finishes the request before a KV handoff is needed.
             "next": _rename_targets(s.next, inbound_rename),
@@ -166,6 +233,8 @@ def _split_pd_stage(
             "name": decode_name,
             "gpu": pd.decode.gpu if pd.decode.gpu is not None else s.gpu,
             "process": pd.decode.process or decode_name,
+            "factory_args": _half_factory_args(s, pd.decode.server_args),
+            "runtime": _half_runtime(s, pd.decode.memory_fraction),
             "next": _rename_targets(s.next, inbound_rename),
             "stream_to": [inbound_rename.get(t, t) for t in s.stream_to],
             "project_payload": {
