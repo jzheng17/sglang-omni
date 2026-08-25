@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import Annotated, Literal, NoReturn
 
 import typer
@@ -814,20 +813,6 @@ def apply_cuda_graph_cli_overrides(
     return pipeline_config
 
 
-def apply_request_waiting_timeout(seconds: float | None) -> None:
-    """Publish the waiting-queue timeout the schedulers read from the environment.
-
-    Upstream reads ``SGLANG_REQ_WAITING_TIMEOUT`` inside
-    ``Scheduler._abort_on_waiting_timeout`` rather than off ``server_args``, and
-    reads it per call, so setting it here reaches every stage process the
-    launcher later spawns. Nothing in this repo referenced the variable, so the
-    bound existed but no deployment could find it.
-    """
-    if seconds is None:
-        return
-    os.environ["SGLANG_REQ_WAITING_TIMEOUT"] = str(seconds)
-
-
 def apply_partial_start_cli_overrides(
     pipeline_config: PipelineConfig,
     *,
@@ -1429,20 +1414,6 @@ def serve(
             ),
         ),
     ] = None,
-    req_waiting_timeout: Annotated[
-        float | None,
-        typer.Option(
-            "--req-waiting-timeout",
-            "--req_waiting_timeout",
-            min=0.0,
-            help=(
-                "Drop a request that has waited longer than this many seconds "
-                "in the waiting queue, answering it with HTTP 503. Bounds how "
-                "long a request may wait, where --max-queued-requests bounds "
-                "how many may wait. Omit to let requests wait indefinitely."
-            ),
-        ),
-    ] = None,
     max_total_tokens: Annotated[
         int | None,
         typer.Option(
@@ -1581,7 +1552,6 @@ def serve(
             updates=generation_server_args_overrides,
             reason="SGLang generation server args override",
         )
-    apply_request_waiting_timeout(req_waiting_timeout)
     merged_config = apply_partial_start_cli_overrides(
         merged_config,
         talker_partial_start=talker_partial_start,
