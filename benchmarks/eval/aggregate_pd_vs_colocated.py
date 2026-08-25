@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Aggregate the PD-vs-colocated sweep into one table.
 
 Arm C is two independent replicas, so a point's throughput is the pair's
