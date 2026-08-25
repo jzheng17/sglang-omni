@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import dataclasses
 import logging
 import multiprocessing
 import os
@@ -793,6 +794,62 @@ def _construct_stage(
     return stage
 
 
+_WEIGHT_SHARING_TIMEOUT_S = 900.0
+
+
+def _weight_sharing_plan(spec: StageLaunchConfig, gpu_id: int | None) -> Any:
+    """Return this half's weight-sharing plan, or None when it does not apply.
+
+    Only reaches a factory that declares ``weight_sharing_plan``, because
+    ``resolve_factory_signature_args`` injects a default only when the factory
+    names it. A stage opts in by taking the parameter.
+
+    The run directory comes from this stage's own endpoint rather than a new
+    argument: ``allocate_endpoints`` puts every stage socket directly in the
+    directory ``create_ipc_runtime_dir`` made for this run.
+    """
+    if spec.pd_execution is None or gpu_id is None or not spec.recv_endpoint:
+        return None
+    if not getattr(spec.pd_execution, "share_weights", True):
+        return None
+    from sglang_omni.model_runner.weight_rendezvous import (
+        RendezvousUnavailable,
+        rendezvous_dir_from_endpoint,
+    )
+    from sglang_omni.model_runner.weight_sharing import WeightSharingPlan
+
+    try:
+        rendezvous_dir = rendezvous_dir_from_endpoint(spec.recv_endpoint)
+    except RendezvousUnavailable:
+        return None
+    return WeightSharingPlan(
+        stage_name=spec.stage_name,
+        peer_stage=spec.pd_execution.partner,
+        rendezvous_dir=rendezvous_dir,
+        gpu_id=int(gpu_id),
+        publishes=bool(getattr(spec.pd_execution, "publishes_weights", True)),
+    )
+
+
+def _adopt_peer_weights(plan: Any, log: logging.Logger) -> Any:
+    """Fetch the peer's parameter handles before this stage takes the GPU lock."""
+    if plan.publishes:
+        return plan
+    from sglang_omni.model_runner.weight_rendezvous import wait_for_parameter_handles
+
+    log.info(
+        f"Waiting for {plan.peer_stage} to publish parameter handles "
+        f"before building {plan.stage_name}"
+    )
+    handles = wait_for_parameter_handles(
+        rendezvous_dir=plan.rendezvous_dir,
+        stage_name=plan.peer_stage,
+        gpu_id=plan.gpu_id,
+        timeout_s=_WEIGHT_SHARING_TIMEOUT_S,
+    )
+    return dataclasses.replace(plan, adopted=handles)
+
+
 def _construct_scheduler(
     spec: StageLaunchConfig,
     gpu_id: int | None,
@@ -801,10 +858,18 @@ def _construct_scheduler(
     """Build a scheduler, serializing GPU factory work per visible device."""
 
     factory = import_string(spec.factory)
+    defaults = dict(spec.factory_arg_defaults)
+    plan = _weight_sharing_plan(spec, gpu_id)
+    if plan is not None:
+        # Note (Audrey Zheng): the adopter waits here, outside
+        # gpu_startup_lock. Waiting inside it would hold the lock against the
+        # publishing half, which needs the same lock to load at all.
+        plan = _adopt_peer_weights(plan, log)
+        defaults["weight_sharing_plan"] = plan
     factory_args = resolve_factory_signature_args(
         factory,
         spec.factory_args,
-        defaults=spec.factory_arg_defaults,
+        defaults=defaults,
     )
     if gpu_id is None:
         return factory(**factory_args)

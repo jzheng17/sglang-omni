@@ -1,0 +1,156 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Hand parameter handles from one PD half to the other at startup.
+
+:mod:`sglang_omni.model_runner.weight_sharing` can export and adopt handles,
+but the two halves are separate processes with no channel between them at load
+time. The KV plane does not supply one: ``prepare_kv_receive`` and
+``send_kv_pages`` are per-transfer and run long after both halves are up.
+
+This uses the directory the run already has. ``create_ipc_runtime_dir`` makes
+one private directory per pipeline instance before any stage is spawned, every
+stage is handed endpoints inside it, and it is removed when the run ends. A
+file there is therefore visible to both halves, private to the run, and cleaned
+up without new ownership rules.
+
+Publishing is a write to a temporary name followed by ``os.replace``, so a
+reader never observes a partial file. Reading returns ``None`` when the peer
+has not published rather than waiting for it: ``_construct_scheduler`` builds
+each stage inside ``gpu_startup_lock(gpu_id)``, so two halves on one device
+load one at a time, and a reader that waited would hold that lock against the
+very half it is waiting for. A half that finds nothing publishes its own
+handles instead, so whichever loads second is the one that adopts.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import pickle
+import time
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+_SUBDIR = "pd-weights"
+_POLL_INTERVAL_S = 0.2
+
+
+class RendezvousUnavailable(RuntimeError):
+    """The run's IPC directory could not be derived from an endpoint."""
+
+
+def rendezvous_dir_from_endpoint(endpoint: str) -> Path:
+    """Return the run's directory, given any ``ipc://`` endpoint from this run.
+
+    ``allocate_endpoints`` puts every socket directly in the run directory, so
+    the parent of an endpoint path is that directory. Deriving it here keeps
+    the halves from needing a new argument threaded through stage startup.
+    """
+    if not endpoint.startswith("ipc://"):
+        raise RendezvousUnavailable(
+            f"expected an ipc:// endpoint to locate the run directory, got {endpoint!r}"
+        )
+    return Path(endpoint[len("ipc://") :]).parent
+
+
+def publish_parameter_handles(
+    handles: dict[str, Any],
+    *,
+    rendezvous_dir: Path,
+    stage_name: str,
+    gpu_id: int,
+) -> Path:
+    """Write *handles* where the peer half can read them. Returns the path.
+
+    The device is recorded alongside them. A CUDA IPC handle names memory on
+    one GPU, so a half on another card must not adopt these, and stating the
+    device here lets the reader check that rather than assume it.
+    """
+    directory = Path(rendezvous_dir) / _SUBDIR
+    directory.mkdir(parents=True, exist_ok=True)
+    final = directory / f"{stage_name}.pkl"
+    staging = directory / f"{stage_name}.pkl.{os.getpid()}"
+    staging.write_bytes(pickle.dumps({"gpu_id": int(gpu_id), "handles": handles}))
+    os.replace(staging, final)
+    logger.info(
+        "published %d parameter handles for %s at %s",
+        len(handles),
+        stage_name,
+        final,
+    )
+    return final
+
+
+def read_parameter_handles(
+    *,
+    rendezvous_dir: Path,
+    stage_name: str,
+    gpu_id: int,
+) -> dict[str, Any] | None:
+    """Return the handles *stage_name* published for *gpu_id*, or None.
+
+    Returns None when the peer has not published, and when it published for a
+    different device.
+
+    This does not wait. ``_construct_scheduler`` builds a stage inside
+    ``gpu_startup_lock(gpu_id)``, so two halves on one device load one at a
+    time and the second one to load finds the first one's file already there.
+    Waiting here would instead hold that lock against the half being waited
+    for, which needs the same lock to load at all.
+    """
+    path = Path(rendezvous_dir) / _SUBDIR / f"{stage_name}.pkl"
+    try:
+        payload = path.read_bytes()
+    except FileNotFoundError:
+        logger.info(
+            "%s has not published parameter handles; this half publishes its own",
+            stage_name,
+        )
+        return None
+    published = pickle.loads(payload)
+    if published["gpu_id"] != int(gpu_id):
+        logger.info(
+            "%s published handles for GPU %s, not GPU %s; this half keeps its own",
+            stage_name,
+            published["gpu_id"],
+            gpu_id,
+        )
+        return None
+    handles = published["handles"]
+    logger.info("adopted %d parameter handles from %s", len(handles), stage_name)
+    return handles
+
+
+def wait_for_parameter_handles(
+    *,
+    rendezvous_dir: Path,
+    stage_name: str,
+    gpu_id: int,
+    timeout_s: float,
+) -> dict[str, Any] | None:
+    """Block until *stage_name* publishes, or give up at the deadline.
+
+    Only safe to call before taking ``gpu_startup_lock``. Inside the lock this
+    would hold it against the very half being waited for, which is why
+    :func:`read_parameter_handles` does not wait.
+
+    Returning None at the deadline lets the caller load its own weights rather
+    than fail the stage, which is the right trade when the peer is absent.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        handles = read_parameter_handles(
+            rendezvous_dir=rendezvous_dir, stage_name=stage_name, gpu_id=gpu_id
+        )
+        if handles is not None:
+            return handles
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "%s published no parameter handles within %.0fs; "
+                "this half loads its own",
+                stage_name,
+                timeout_s,
+            )
+            return None
+        time.sleep(_POLL_INTERVAL_S)
