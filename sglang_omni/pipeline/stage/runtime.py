@@ -1064,12 +1064,24 @@ class Stage:
     def _launch_pd_handoff(self, request_id: str, handoff: Any) -> None:
         # Note (Yue Yin): ACK latency must not stop this stage from draining
         # scheduler output for unrelated requests.
+        self._pd_handoffs_in_flight = getattr(self, "_pd_handoffs_in_flight", 0) + 1
+        peak = getattr(self, "_pd_handoff_peak", 0)
+        if self._pd_handoffs_in_flight > peak:
+            self._pd_handoff_peak = self._pd_handoffs_in_flight
+            logger.info(
+                "PD handoff concurrency high-water mark %d",
+                self._pd_handoffs_in_flight,
+            )
         task = asyncio.create_task(self._send_pd_handoff(request_id, handoff))
+        task.add_done_callback(self._on_pd_handoff_done)
         self._receive_tasks.add(task)
         task.add_done_callback(self._receive_tasks.discard)
         task.add_done_callback(
             lambda done: self._on_background_task_done(done, f"PD handoff {request_id}")
         )
+
+    def _on_pd_handoff_done(self, _task: Any) -> None:
+        self._pd_handoffs_in_flight = getattr(self, "_pd_handoffs_in_flight", 1) - 1
 
     async def _send_pd_handoff(self, request_id: str, handoff: Any) -> None:
         metadata = PrefillContinuationProducer(tp_size=1).prepare_rank_metadata(
