@@ -15,7 +15,7 @@ import pytest
 
 from sglang_omni.pipeline.stage_workers import StageGroup
 
-TRACEBACK = 'Traceback (most recent call last):\n  RuntimeError: factory boom'
+TRACEBACK = "Traceback (most recent call last):\n  RuntimeError: factory boom"
 
 
 class _DeadProcess:

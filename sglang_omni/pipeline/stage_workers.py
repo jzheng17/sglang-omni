@@ -196,7 +196,6 @@ def _patched_spawn_env(spec: StageWorkerProcessSpec):
                 os.environ[key] = value
 
 
-
 def _read_startup_error(channel: Any, timeout: float | None = None) -> str | None:
     """Return a child's startup traceback, or None if it reported none yet."""
     try:
@@ -206,6 +205,7 @@ def _read_startup_error(channel: Any, timeout: float | None = None) -> str | Non
     except (queue.Empty, EOFError, OSError, ValueError):
         # ValueError/OSError: the child closed the queue as it exited.
         return None
+
 
 class StageGroup:
     """Lifecycle manager for one or more OS processes in a topology group."""
