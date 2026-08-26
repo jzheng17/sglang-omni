@@ -1,6 +1,6 @@
 # Prefill/Decode Disaggregation
 
-> TL;DR: PD disaggregation splits one stage into a prefill process and a decode process, so a prefill no longer stalls the decoding already in flight. It removes that interference almost completely, on any placement, including both halves on one GPU. How much hardware you then give each half is a separate, continuous choice, and it is the choice that decides what the split costs and what it can return. One prefill half against one decode half on two cards is the configuration measured here: it has parity with two colocated replicas as its throughput ceiling, and on Qwen3-Omni thinker it currently lands below that.
+> TL;DR: PD disaggregation splits one stage into a prefill process and a decode process, so a prefill no longer stalls the decoding already in flight. How much hardware you give each half is a separate, continuous choice, and it decides what the split returns. **Both halves on one GPU is the configuration that pays**: on Qwen3-Omni thinker it removed the interference and reached 28.90 requests per second against a colocated replica's 21.16 on the same card. One half per card removes the interference too, but its throughput ceiling is parity with two colocated replicas by arithmetic, and it currently lands below that.
 
 A colocated replica runs prefill and decode on one card and one scheduler thread. A prefill therefore blocks the decode steps of every request already running. On Qwen3-Omni that cost is large, and it is worst on images, where a 6127-token prompt cannot be chunked.
 
@@ -36,7 +36,7 @@ Prefill share is governed by prompt length divided by output length.
 
 This sets what a *second card* for prefill can be worth. Splitting across two cards divides the hardware evenly; against a 2.6% share that leaves the prefill card about 90% idle, which is what the equal-GPU-count run measured. Long prompts with short outputs — document QA, long-audio transcription, classification, scoring — are the shape that earns a second card. Short prompts with long outputs are not.
 
-A low share does not rule out splitting. It argues for spending less hardware on it: the same-GPU form separates the halves without a second card at all.
+A low share does not rule out splitting. It argues for spending less hardware on it: the same-GPU form separates the halves without a second card at all, and on the measurements below it is the shape that wins on throughput.
 
 ### 2. Which overload behaviour do you want?
 
@@ -48,15 +48,23 @@ Decide it, because the default is an unbounded queue and it surfaces as latency 
 
 ### 4. Are you optimizing throughput, or inter-token stability?
 
-Both are real goals and they select different configurations.
+Both are real goals, and on one card the same configuration serves both. Across two cards they diverge.
 
-**Inter-token stability.** A colocated replica pays 5.9x to 8.5x on the inter-token gap that overlaps a prefill on text, and 8.4x to 20.5x on images. PD brings that to 1.0x: on the image arm a prefill in flight on the other card is statistically indistinguishable from no prefill at all. Images are worst because a 6127-token image prompt cannot be chunked — `_needs_full_prefill` forces the whole prompt through one step and no decode work batches with it. For a stream with a repeating deadline, such as speech output or a full-duplex voice turn, this jitter *is* the SLO and a throughput number does not describe it. Any split addresses it, including the same-GPU form.
+**Inter-token stability.** A colocated replica pays for a prefill that lands while other requests are decoding. Measured on one H200 at a load both arms serve fully, the inter-token gap that overlaps a prefill is 2.28x the gap that does not, and the gap itself is 26.18 ms. Splitting the halves onto that same card brings the ratio to 0.84 and the gap to 8.95 ms. Across two cards the ratio reaches 1.0 on text and on images, where a colocated replica pays 8.4x to 20.5x because a 6127-token image prompt cannot be chunked and no decode work batches with it.
 
-**Throughput.** One prefill half against one decode half, on two cards, has parity as its ceiling. That is arithmetic, not a defect: a card doing both jobs has the harmonic mean of its prefill-only and decode-only capacities, a 1:1 pair has the minimum of the two, and the minimum never exceeds the harmonic mean, with equality only when the halves are exactly balanced. So 1:1 across two cards is the wrong configuration to reach for when throughput is the goal — not because splitting is wrong, but because that particular ratio cannot exceed parity even in theory.
+Read that ratio only where the arm serves what is offered. Past saturation the overlapping gaps carry queueing rather than contention, and the same measurement reports 12.9 and then 2216 as the offered rate rises. Report the achieved rate beside it.
 
-The configurations whose arithmetic differs are ratios other than 1:1, and both halves on one card. Neither has been measured here yet. Ratios other than 1:1 are not configurable today.
+For a stream with a repeating deadline, such as speech output or a full-duplex voice turn, this jitter *is* the SLO and a throughput number does not describe it.
 
-The measured gap is also larger than the arithmetic predicts: PD's decode card carries about a 2.9x handicap while its prefill card carries none. Four candidates can account for it and the data cannot yet separate them — the forced `page_size=1`, the forced `disable_radix_cache`, the absence of mixed-chunk batching on the decode side, and the cost of receiving KV over CUDA IPC. Three of those four are current constraints of this implementation rather than properties of disaggregation, so expect this number to move.
+**Time to first token under load.** The two shapes part company as load rises. On one H200 at an offered 16 requests per second, a colocated replica completed 13.1 to 13.3 per second with a p95 first-token time of 7.5 to 8.8 seconds. The same card split into two halves completed 10.6 to 10.9 per second with a p95 of 0.124 seconds. Colocated pushes more requests through and lets them wait; the split holds the first token flat and admits fewer. Which one is right depends on whether a late first token is a failure for you.
+
+**Throughput on one card.** Splitting a card wins. Measured with an open-loop client at 42-token prompts, a colocated replica saturated at 21.16 requests per second and the same card split reached 28.90 and had not yet saturated. Nothing is divided in this shape: both halves draw on the same SMs, and the split only moves prefill off the decode scheduler thread.
+
+That result depends on sharing the weights. Without it the two halves load a copy each, which leaves them 22,206 KV tokens apiece instead of 665,596 between them.
+
+**Throughput across two cards.** One prefill half against one decode half has parity as its ceiling. That is arithmetic, not a defect: a card doing both jobs has the harmonic mean of its prefill-only and decode-only capacities, a 1:1 pair has the minimum of the two, and the minimum never exceeds the harmonic mean, with equality only when the halves are exactly balanced. So 1:1 across two cards is the wrong configuration to reach for when throughput is the goal.
+
+The measured gap is larger than the arithmetic predicts: PD's decode card carries about a 2.9x handicap while its prefill card carries none. Two candidates remain after measurement — the absence of mixed-chunk batching on the decode side, and the cost of receiving KV over CUDA IPC. The forced `page_size=1` and `disable_radix_cache` are not the cause: applied to a colocated replica on a workload with no prefix reuse they cost 2.6% and 0.6%, against an A/A band of 1.2%.
 
 ## Turn it on
 
