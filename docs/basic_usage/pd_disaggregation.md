@@ -1,6 +1,6 @@
 # Prefill/Decode Disaggregation
 
-> TL;DR: PD disaggregation splits one stage into a prefill process and a decode process, so a prefill no longer stalls the decoding already in flight. How much hardware you give each half is a separate, continuous choice, and it decides what the split returns. **Both halves on one GPU is the configuration that pays**: on Qwen3-Omni thinker it removed the interference and reached 28.90 requests per second against a colocated replica's 21.16 on the same card. One half per card removes the interference too, but its throughput ceiling is parity with two colocated replicas by arithmetic, and it currently lands below that.
+> TL;DR: PD disaggregation splits one stage into a prefill process and a decode process, so a prefill no longer stalls the decoding already in flight. How much hardware you give each half is a separate, continuous choice, and it decides what the split returns. **Both halves on one GPU is the placement to reach for**, and what it buys is latency rather than throughput: on Qwen3-Omni thinker it held the p95 first-token time under 0.65 s where a colocated replica on the same card reached 26 s, and cut the gap between tokens by about three times. It completes fewer requests per second than colocated while doing so. One half per card removes the interference too, but its throughput ceiling is parity with two colocated replicas by arithmetic, and it currently lands below that.
 
 A colocated replica runs prefill and decode on one card and one scheduler thread. A prefill therefore blocks the decode steps of every request already running. On Qwen3-Omni that cost is large, and it is worst on images, where a 6127-token prompt cannot be chunked.
 
@@ -36,7 +36,7 @@ Prefill share is governed by prompt length divided by output length.
 
 This sets what a *second card* for prefill can be worth. Splitting across two cards divides the hardware evenly; against a 2.6% share that leaves the prefill card about 90% idle, which is what the equal-GPU-count run measured. Long prompts with short outputs — document QA, long-audio transcription, classification, scoring — are the shape that earns a second card. Short prompts with long outputs are not.
 
-A low share does not rule out splitting. It argues for spending less hardware on it: the same-GPU form separates the halves without a second card at all, and on the measurements below it is the shape that wins on throughput.
+A low share does not rule out splitting. It argues for spending less hardware on it: the same-GPU form separates the halves without a second card at all.
 
 ### 2. Which overload behaviour do you want?
 
@@ -58,9 +58,15 @@ For a stream with a repeating deadline, such as speech output or a full-duplex v
 
 **Time to first token under load.** The two shapes part company as load rises. On one H200 at an offered 16 requests per second, a colocated replica completed 13.1 to 13.3 per second with a p95 first-token time of 7.5 to 8.8 seconds. The same card split into two halves completed 10.6 to 10.9 per second with a p95 of 0.124 seconds. Colocated pushes more requests through and lets them wait; the split holds the first token flat and admits fewer. Which one is right depends on whether a late first token is a failure for you.
 
-**Throughput on one card.** Splitting a card wins. Measured with an open-loop client at 42-token prompts, a colocated replica saturated at 21.16 requests per second and the same card split reached 28.90 and had not yet saturated. Nothing is divided in this shape: both halves draw on the same SMs, and the split only moves prefill off the decode scheduler thread.
+**Throughput on one card.** Which shape wins depends on whether the client streams.
 
-That result depends on sharing the weights. Without it the two halves load a copy each, which leaves them 22,206 KV tokens apiece instead of 665,596 between them.
+Against a streaming client, colocated completes more: at an offered 24 it reached 16.2 to 16.4 requests per second against the split card's 10.0 to 10.3. Against a non-streaming open-loop client the order reverses, with the split card at 28.90 against 21.16. Production traffic on the OpenAI-compatible route streams, so the first pair is the one to plan against.
+
+The trade is visible in the same runs. Colocated buys those extra completions by letting requests wait: its p95 first-token time is 23.2 to 26.5 seconds at that rate, against 0.53 to 0.65 seconds for the split card. It finishes them sooner once started, with a p95 total of 26.7 to 30.1 seconds against 80.7 to 83.7.
+
+At a load both shapes serve fully, the split card is better on every latency measure: 0.067 s first token against 0.105, 8.96 ms between tokens against 26.6, and a p95 total of 1.9 s against 4.8.
+
+Splitting one card at all depends on sharing the weights. Without it the two halves load a copy each, which leaves them 22,206 KV tokens apiece instead of 665,596 between them.
 
 **Throughput across two cards.** One prefill half against one decode half has parity as its ceiling. That is arithmetic, not a defect: a card doing both jobs has the harmonic mean of its prefill-only and decode-only capacities, a 1:1 pair has the minimum of the two, and the minimum never exceeds the harmonic mean, with equality only when the halves are exactly balanced. So 1:1 across two cards is the wrong configuration to reach for when throughput is the goal.
 
