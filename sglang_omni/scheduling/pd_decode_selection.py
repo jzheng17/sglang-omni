@@ -39,6 +39,13 @@ def select_decode_stage(targets: Sequence[str], request_id: str) -> str:
     The hash spreads requests evenly without coordination. A policy that needs
     global state -- least-loaded, or affinity to a cached prefix -- has to be
     decided in one place and carried to the ranks, not computed on each.
+
+    The coordinator's admission binding is exactly that shape, and
+    `OmniScheduler._resolve_decode_stage` prefers it when the Decode process is
+    replicated: it is chosen once per request and carried on the message
+    envelope, so every rank reads the same value without computing anything.
+    This function decides the rest -- no replicas, or the binding has not
+    arrived -- and is where a policy would go that the coordinator cannot make.
     """
     if not targets:
         raise ValueError("no decode targets to select from")
