@@ -185,6 +185,9 @@ class Stage:
                 partner=pd_execution.partner,
                 decode_targets=_decode_targets(rank_endpoints, pd_execution.partner)
                 or pd_execution.decode_targets,
+                resolve_decode_binding=self._decode_binding_resolver(
+                    pd_execution.partner
+                ),
             )
             self._comm.register_kv_pool(pool)
             if receiver is not None:
@@ -204,6 +207,31 @@ class Stage:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._scheduler_crash_error: BaseException | None = None
         self._background_task_error: BaseException | None = None
+
+    def _decode_binding_resolver(self, partner: str):
+        """Return a lookup from request id to bound Decode instance, or None.
+
+        The coordinator binds one instance per replicated Process at admission
+        and carries the choice on the envelope, which is where
+        ``_record_replica_bindings`` files it. Handing the scheduler a lookup
+        rather than the tables keeps it out of the replica machinery, and
+        returns None on a build that has no replicas so the request-id hash
+        stays in charge.
+        """
+        topology = getattr(self, "_replica_topology", None)
+        if topology is None or not topology.is_replicated(partner):
+            return None
+
+        def lookup(request_id: str) -> str | None:
+            bindings = self._replica_bindings.get(request_id)
+            if not bindings:
+                return None
+            replica_id = bindings.get(partner)
+            if replica_id is None:
+                return None
+            return topology.resolve(partner, replica_id)
+
+        return lookup
 
     async def start(self) -> None:
         if self._running:

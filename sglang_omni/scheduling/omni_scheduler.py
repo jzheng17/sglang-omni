@@ -562,6 +562,7 @@ class OmniScheduler:
         role: str,
         partner: str,
         decode_targets: tuple[str, ...] = (),
+        resolve_decode_binding: Any = None,
     ) -> tuple[Any, Any | None]:
         if self.tp_size != 1:
             raise NotImplementedError("PR3 PD runtime supports tp_size == 1 only")
@@ -575,6 +576,11 @@ class OmniScheduler:
         self._pd_role = role
         self._pd_partner = partner
         self._pd_decode_targets = tuple(decode_targets) or (partner,)
+        # Note (Audrey Zheng): when the Decode process is replicated, the
+        # coordinator already chose an instance for this request at admission
+        # and carries it on the envelope. Prefer that choice so one request has
+        # one answer; see `_resolve_decode_stage`.
+        self._pd_decode_binding_fn = resolve_decode_binding
         self._pd_pool_id = f"{stage_name}:kv"
         raw_pool = self.token_to_kv_pool_allocator.get_kvcache()
         layout_id = (
@@ -756,7 +762,49 @@ class OmniScheduler:
         targets = self.__dict__.get("_pd_decode_targets") or ()
         if not targets:
             return self._pd_partner
-        return select_decode_stage(targets, str(getattr(req, "rid", "")))
+        rid = str(getattr(req, "rid", ""))
+        bound = self._decode_stage_from_binding(rid, targets)
+        if bound is not None:
+            return bound
+        return select_decode_stage(targets, rid)
+
+    def _decode_stage_from_binding(
+        self, rid: str, targets: tuple[str, ...]
+    ) -> str | None:
+        """Return the Decode instance the coordinator bound this request to.
+
+        A replicated Process gets one instance per request, chosen at admission
+        and carried on the message envelope, so every Prefill rank reads the
+        same value. That satisfies the constraint `select_decode_stage`
+        documents, and it keeps one request on one Decode half by the same
+        mechanism the rest of the pipeline uses. Returns None when the Decode
+        process is not replicated or the binding has not arrived, and the hash
+        then decides.
+        """
+        fn = self.__dict__.get("_pd_decode_binding_fn")
+        if fn is None:
+            return None
+        try:
+            name = fn(rid)
+        except Exception:
+            logger.warning(
+                "PD: replica binding lookup failed for %s; falling back to the "
+                "request-id hash",
+                rid,
+                exc_info=True,
+            )
+            return None
+        if name is None:
+            return None
+        if name not in targets:
+            logger.warning(
+                "PD: replica binding named %r, which is not a Decode target "
+                "(%s); falling back to the request-id hash",
+                name,
+                ", ".join(targets),
+            )
+            return None
+        return name
 
     def bind_model_runner(self, model_runner: Any) -> None:
         """Attach a custom runner and its SGLang execution-contract bridge.
