@@ -63,6 +63,33 @@ def _error_text(exc: BaseException) -> str:
     return str(exc) or type(exc).__name__
 
 
+def _decode_targets(
+    rank_endpoints: dict[str, tuple[str, ...]],
+    partner: str,
+) -> tuple[str, ...]:
+    """Return every Decode instance this Prefill half may send to.
+
+    Replicating a process renames its stages ``<name>@r0``, ``<name>@r1``, and
+    every instance gets its own rank endpoints, so the instances are already
+    named here. Deriving the list from those keys keeps the count out of the
+    stage's arguments.
+
+    The order is sorted rather than dictionary order because every Prefill
+    rank has to agree: the KV send is rank-addressed, so ranks that disagree
+    scatter one request's shards across Decode halves and nothing checks it.
+
+    An unreplicated Decode half yields exactly its own name, so the choice is
+    a constant and behaviour is unchanged.
+    """
+    if not rank_endpoints:
+        return ()
+    prefix = f"{partner}@"
+    targets = [
+        name for name in rank_endpoints if name == partner or name.startswith(prefix)
+    ]
+    return tuple(sorted(targets))
+
+
 class Stage:
     """IO shell for one pipeline stage.
 
@@ -156,7 +183,8 @@ class Stage:
                 stage_name=name,
                 role=pd_execution.role,
                 partner=pd_execution.partner,
-                decode_targets=pd_execution.decode_targets,
+                decode_targets=_decode_targets(rank_endpoints, pd_execution.partner)
+                or pd_execution.decode_targets,
             )
             self._comm.register_kv_pool(pool)
             if receiver is not None:
