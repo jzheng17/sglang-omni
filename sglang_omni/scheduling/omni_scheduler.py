@@ -594,13 +594,7 @@ class OmniScheduler:
             self.batch_result_processor,
             disaggregation_mode=DisaggregationMode.DECODE,
         )
-        # Note (Audrey Zheng): from here the allocator has two callers on two
-        # threads -- this scheduler, and the comm event loop through the
-        # receiver below -- and its alloc is a read-modify-write with no lock
-        # of its own. Wrap it once, before either side is handed it.
-        self.token_to_kv_pool_allocator = LockedKVAllocator(
-            self.token_to_kv_pool_allocator
-        )
+        self._install_locked_kv_allocator()
         receiver = AllocatorKVReceiver(
             pool_id=self._pd_pool_id,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -1634,6 +1628,54 @@ class OmniScheduler:
             "models/qwen3_tts sets 16 for its generation stage.",
             stage_name,
         )
+
+    # Note (Audrey Zheng): the holders that call alloc or free on the KV
+    # allocator. `bootstrap.py` hands the same object to each of them before
+    # this scheduler exists, so rebinding only our own attribute would leave
+    # three unsynchronised aliases.
+    _KV_ALLOCATOR_HOLDERS = ("tree_cache", "prefill_manager", "decode_manager")
+
+    def _install_locked_kv_allocator(self) -> None:
+        """Give every holder of the KV allocator the same locked object.
+
+        From here the allocator has two callers on two threads -- this
+        scheduler and the comm event loop, through the receiver -- and its
+        alloc is a read-modify-write with no lock of its own. One lock only
+        helps if every caller goes through it, so the wrapper has to reach the
+        tree cache and both managers as well.
+
+        Rebinding after construction rather than wrapping in `bootstrap.py` is
+        deliberate: upstream's `SWAChunkCache.__init__` asserts the allocator's
+        concrete type, and a proxy handed to the constructor would fail that
+        assert for models that use it.
+
+        This covers the holders that exist today. `_kv_allocator_holders`
+        reports what was rebound so a test can assert they all agree, which is
+        what would catch a fourth holder appearing.
+        """
+        locked = LockedKVAllocator(self.token_to_kv_pool_allocator)
+        self.token_to_kv_pool_allocator = locked
+        for name in self._KV_ALLOCATOR_HOLDERS:
+            holder = getattr(self, name, None)
+            if holder is None:
+                continue
+            if not hasattr(holder, "token_to_kv_pool_allocator"):
+                raise RuntimeError(
+                    f"PD decode half: {name} has no token_to_kv_pool_allocator "
+                    "to rebind, so its allocations would bypass the lock"
+                )
+            holder.token_to_kv_pool_allocator = locked
+
+    def _kv_allocator_holders(self) -> dict[str, Any]:
+        """Every allocator reference this scheduler can reach, by holder name."""
+        found: dict[str, Any] = {
+            "scheduler": self.__dict__.get("token_to_kv_pool_allocator")
+        }
+        for name in self._KV_ALLOCATOR_HOLDERS:
+            holder = getattr(self, name, None)
+            if holder is not None:
+                found[name] = getattr(holder, "token_to_kv_pool_allocator", None)
+        return found
 
     def _pd_decode_depth(self) -> int:
         """Requests this Decode half is holding, waiting or running.

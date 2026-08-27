@@ -11,7 +11,19 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 from sglang_omni.scheduling.pd_alloc_lock import LockedKVAllocator
+
+
+class _FakeAllocator:
+    """Stands in for the real allocator; only identity matters here."""
+
+    def alloc(self, n):  # pragma: no cover - never called
+        return list(range(n))
+
+    def free(self, indices):  # pragma: no cover - never called
+        return None
 
 
 class _RacyAllocator:
@@ -85,3 +97,43 @@ def test_freeing_returns_the_slots() -> None:
 
     allocator.free(taken)
     assert allocator.available_size() == 8
+
+
+def test_every_holder_of_the_allocator_gets_the_same_locked_object() -> None:
+    """One lock only helps if no caller keeps an unwrapped alias."""
+    from types import SimpleNamespace
+
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    raw = _FakeAllocator()
+    scheduler = OmniScheduler.__new__(OmniScheduler)
+    scheduler.token_to_kv_pool_allocator = raw
+    scheduler.tree_cache = SimpleNamespace(token_to_kv_pool_allocator=raw)
+    scheduler.prefill_manager = SimpleNamespace(token_to_kv_pool_allocator=raw)
+    scheduler.decode_manager = SimpleNamespace(token_to_kv_pool_allocator=raw)
+
+    scheduler._install_locked_kv_allocator()
+
+    holders = scheduler._kv_allocator_holders()
+    assert set(holders) == {
+        "scheduler",
+        "tree_cache",
+        "prefill_manager",
+        "decode_manager",
+    }
+    assert len({id(a) for a in holders.values()}) == 1
+    assert all(isinstance(a, LockedKVAllocator) for a in holders.values())
+
+
+def test_a_holder_that_cannot_be_rebound_is_an_error() -> None:
+    """Silently skipping it would leave an alias outside the lock."""
+    from types import SimpleNamespace
+
+    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+
+    scheduler = OmniScheduler.__new__(OmniScheduler)
+    scheduler.token_to_kv_pool_allocator = _FakeAllocator()
+    scheduler.tree_cache = SimpleNamespace()  # no allocator attribute
+
+    with pytest.raises(RuntimeError, match="would bypass the lock"):
+        scheduler._install_locked_kv_allocator()
