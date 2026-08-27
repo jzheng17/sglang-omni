@@ -60,8 +60,14 @@ def publish_parameter_handles(
     rendezvous_dir: Path,
     stage_name: str,
     gpu_id: int,
+    weight_bytes: int = 0,
 ) -> Path:
     """Write *handles* where the peer half can read them. Returns the path.
+
+    ``weight_bytes`` travels with them so the adopting half can check that it
+    has room to materialize its own copy before it loads one. On one card the
+    publisher is already holding weights and its KV pool by then, and the
+    adopter still has to load before it can swap.
 
     The device is recorded alongside them. A CUDA IPC handle names memory on
     one GPU, so a half on another card must not adopt these, and stating the
@@ -71,7 +77,15 @@ def publish_parameter_handles(
     directory.mkdir(parents=True, exist_ok=True)
     final = directory / f"{stage_name}.pkl"
     staging = directory / f"{stage_name}.pkl.{os.getpid()}"
-    staging.write_bytes(pickle.dumps({"gpu_id": int(gpu_id), "handles": handles}))
+    staging.write_bytes(
+        pickle.dumps(
+            {
+                "gpu_id": int(gpu_id),
+                "handles": handles,
+                "weight_bytes": int(weight_bytes),
+            }
+        )
+    )
     os.replace(staging, final)
     logger.info(
         "published %d parameter handles for %s at %s",
@@ -122,6 +136,20 @@ def read_parameter_handles(
     return handles
 
 
+def read_published_weight_bytes(
+    *,
+    rendezvous_dir: Path,
+    stage_name: str,
+) -> int:
+    """Return the byte count the publisher recorded, or 0 if it recorded none."""
+    path = Path(rendezvous_dir) / _SUBDIR / f"{stage_name}.pkl"
+    try:
+        published = pickle.loads(path.read_bytes())
+    except (FileNotFoundError, KeyError, EOFError):
+        return 0
+    return int(published.get("weight_bytes", 0))
+
+
 def wait_for_parameter_handles(
     *,
     rendezvous_dir: Path,
@@ -129,22 +157,25 @@ def wait_for_parameter_handles(
     gpu_id: int,
     timeout_s: float,
 ) -> dict[str, Any] | None:
-    """Block until *stage_name* publishes, or give up at the deadline.
+    """Block until *stage_name* publishes, then return its handles or None.
+
+    The wait is for the file to appear, not for handles this half can use.
+    A peer on another device publishes handles that name memory on that
+    device, and no amount of waiting changes that, so this returns as soon as
+    it can decide. Treating a device mismatch as "not yet" made a cross-GPU
+    pair wait out the whole timeout and fail to start.
 
     Only safe to call before taking ``gpu_startup_lock``. Inside the lock this
     would hold it against the very half being waited for, which is why
     :func:`read_parameter_handles` does not wait.
 
-    Returning None at the deadline lets the caller load its own weights rather
-    than fail the stage, which is the right trade when the peer is absent.
+    Returning None lets the caller load its own weights rather than fail the
+    stage, which is the right trade both when the peer is absent and when it
+    is on another card.
     """
+    path = Path(rendezvous_dir) / _SUBDIR / f"{stage_name}.pkl"
     deadline = time.monotonic() + timeout_s
-    while True:
-        handles = read_parameter_handles(
-            rendezvous_dir=rendezvous_dir, stage_name=stage_name, gpu_id=gpu_id
-        )
-        if handles is not None:
-            return handles
+    while not path.exists():
         if time.monotonic() >= deadline:
             logger.warning(
                 "%s published no parameter handles within %.0fs; "
@@ -154,3 +185,6 @@ def wait_for_parameter_handles(
             )
             return None
         time.sleep(_POLL_INTERVAL_S)
+    return read_parameter_handles(
+        rendezvous_dir=rendezvous_dir, stage_name=stage_name, gpu_id=gpu_id
+    )
