@@ -1074,7 +1074,13 @@ class Stage:
         gate = self.__dict__.get("_pd_handoff_semaphore")
         if gate is not None:
             return gate
-        limit = getattr(self.pd_execution, "max_inflight_handoffs", None)
+        # Note (Audrey Zheng): read the attribute defensively. A stage that
+        # never went through __init__ has no pd_execution, and the
+        # AttributeError would be raised inside the handoff task, where it
+        # stops the send without the caller ever seeing why.
+        limit = getattr(
+            getattr(self, "pd_execution", None), "max_inflight_handoffs", None
+        )
         if not limit:
             return None
         gate = asyncio.Semaphore(int(limit))
