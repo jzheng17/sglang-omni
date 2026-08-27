@@ -260,7 +260,10 @@ class PDConfig(BaseModel):
     # loading its own, which is the state to fall back to if sharing is ever
     # suspected of a fault, and is also how the saving is measured.
     share_weights: bool = True
-
+    # Note (Audrey Zheng): how much work Decode may have pending before
+    # Prefill stops producing more. Unset leaves Prefill unthrottled, which
+    # is how overload currently shows up as latency rather than as rejection.
+    decode_pending_limit: int | None = Field(default=None, gt=0)
 
 
 class PDExecution(BaseModel):
@@ -278,7 +281,7 @@ class PDExecution(BaseModel):
     max_inflight_handoffs: int | None = None
     share_weights: bool = True
     publishes_weights: bool = True
-
+    decode_pending_limit: int | None = None
 
 
 class StageConfig(BaseModel):
