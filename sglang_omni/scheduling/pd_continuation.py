@@ -76,6 +76,12 @@ class DecodeContinuation:
     speculative: bool = False
     multimodal_resume: dict[str, Any] | None = None
     stage_payload: dict[str, Any] | None = None
+    # Note (Audrey Zheng): the Decode half runs its own waiting queue, and both
+    # the queue-limit eviction and retraction rank requests by priority. A
+    # continuation that drops it hands Decode a request whose importance is
+    # unknown, so those rankings fall back to arrival order and an interactive
+    # request cannot outrank a batch one after the handoff.
+    priority: int | None = None
 
     def __post_init__(self) -> None:
         if self.version != CONTINUATION_VERSION:
@@ -492,13 +498,30 @@ class ContinuationAwareKVReceiver:
         target_tp_size: int = 1,
         is_local: bool = True,
         allowed_resume_schemas: frozenset[str] = frozenset(),
+        pending_depth_fn: Callable[[], int] | None = None,
     ) -> None:
+        self._pending_depth_fn = pending_depth_fn
         self._inner = inner
         self._controller = controller
         self._source_tp_size = source_tp_size
         self._target_tp_size = target_tp_size
         self._is_local = is_local
         self._allowed_resume_schemas = allowed_resume_schemas
+
+    def pending_depth(self) -> int | None:
+        """Requests this Decode half is holding, or None if it cannot say.
+
+        The sender reads this off the ack to pace itself. Returning None keeps a
+        receiver that has no such notion out of the sender's decision entirely,
+        rather than telling it zero.
+        """
+        if self._pending_depth_fn is None:
+            return None
+        try:
+            return max(0, int(self._pending_depth_fn()))
+        except Exception:
+            logger.debug("pending_depth_fn failed", exc_info=True)
+            return None
 
     def reserve(self, request: KVTransferPrepareMessage) -> KVPageDestination:
         continuation, continuation_expected = self._decode_metadata(request)

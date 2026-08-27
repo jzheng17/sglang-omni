@@ -231,6 +231,7 @@ def _split_pd_stage(
                 max_inflight_handoffs=pd.max_inflight_handoffs,
                 share_weights=pd.share_weights,
                 publishes_weights=prefill_publishes,
+
             ),
         },
     )
@@ -258,6 +259,7 @@ def _split_pd_stage(
                 max_inflight_handoffs=pd.max_inflight_handoffs,
                 share_weights=pd.share_weights,
                 publishes_weights=not prefill_publishes,
+
             ),
         },
     )

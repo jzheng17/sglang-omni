@@ -172,6 +172,7 @@ class PDConfig(BaseModel):
     share_weights: bool = True
 
 
+
 class PDExecution(BaseModel):
     """Compiler-generated PD execution metadata for one physical half.
 
@@ -187,6 +188,7 @@ class PDExecution(BaseModel):
     max_inflight_handoffs: int | None = None
     share_weights: bool = True
     publishes_weights: bool = True
+
 
 
 class StageConfig(BaseModel):
