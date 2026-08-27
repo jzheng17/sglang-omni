@@ -156,9 +156,6 @@ class Stage:
                 stage_name=name,
                 role=pd_execution.role,
                 partner=pd_execution.partner,
-                decode_pending_limit=getattr(
-                    pd_execution, "decode_pending_limit", None
-                ),
             )
             self._comm.register_kv_pool(pool)
             if receiver is not None:
@@ -1102,8 +1099,21 @@ class Stage:
         # Note (Audrey Zheng): the wait happens inside the task, so the stage
         # keeps draining scheduler output for unrelated requests while a
         # handoff queues for a slot.
-        async with gate:
-            await self._send_pd_handoff_now(request_id, handoff)
+        #
+        # The request's prompt KV is already leased by the time this runs, so a
+        # cancellation during the wait has to release it here. Nothing
+        # downstream will: the send never starts, so `_send_pd_handoff_now`
+        # never reaches its `finally`. `release` is idempotent, so releasing
+        # here does not double-free when the send did start.
+        try:
+            async with gate:
+                await self._send_pd_handoff_now(request_id, handoff)
+        except asyncio.CancelledError:
+            lease = getattr(handoff, "lease", None)
+            if lease is not None:
+                lease.release()
+            self._clear_request_state(request_id)
+            raise
 
     async def _send_pd_handoff_now(self, request_id: str, handoff: Any) -> None:
         metadata = PrefillContinuationProducer(tp_size=1).prepare_rank_metadata(

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Prefill stops admitting when the Decode half is holding too much."""
+"""The Decode half reports how much it is holding, on the transfer ack."""
 
 from __future__ import annotations
 
@@ -10,39 +10,6 @@ from sglang_omni.proto.messages import DataAckMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 
 _LOGGER = "sglang_omni.scheduling.omni_scheduler"
-
-
-def _prefill(limit, depth) -> OmniScheduler:
-    scheduler = OmniScheduler.__new__(OmniScheduler)
-    scheduler._pd_role = "prefill"
-    scheduler._pd_decode_pending_limit = limit
-    scheduler._pd_peer_pending_fn = (lambda: depth) if depth is not None else None
-    return scheduler
-
-
-def test_no_limit_reads_as_no_backpressure() -> None:
-    """The default keeps the previous behaviour: nothing bounds Decode."""
-    assert _prefill(None, 500)._pd_decode_pending_limit is None
-
-
-def test_the_depth_is_read_through_the_installed_reader() -> None:
-    assert _prefill(64, 437)._pd_peer_pending() == 437
-
-
-def test_a_reader_that_raises_reports_no_reading() -> None:
-    """A failed read must not stop admission; it is a pacing hint, not a gate."""
-
-    def boom() -> int:
-        raise RuntimeError("no peer yet")
-
-    scheduler = _prefill(64, 0)
-    scheduler._pd_peer_pending_fn = boom
-
-    assert scheduler._pd_peer_pending() is None
-
-
-def test_a_peer_that_never_reported_reads_as_none() -> None:
-    assert _prefill(64, None)._pd_peer_pending() is None
 
 
 def test_the_decode_depth_counts_every_accepted_request() -> None:

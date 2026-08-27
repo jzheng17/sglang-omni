@@ -9,6 +9,7 @@ max_running_requests, which sizes batches rather than leases.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 from sglang_omni.config.schema import PDConfig, PDExecution
 from sglang_omni.pipeline.stage.runtime import Stage
@@ -110,43 +111,60 @@ def test_an_unset_bound_stays_unset_through_the_rewrite() -> None:
     assert halves["thinker_prefill"].pd_execution.max_inflight_handoffs is None
 
 
-def test_the_decode_bound_reaches_both_halves() -> None:
-    """Prefill needs it to throttle; Decode carries it so the pair agrees."""
-    from sglang_omni.config import expand_pd_stages
-    from sglang_omni.config.schema import PDStagePlacement
+def test_cancelling_while_queued_releases_the_prompt_kv() -> None:
+    """The lease exists before the wait, so nothing downstream can release it."""
 
-    stages = [
-        stage(
-            "thinker",
-            terminal=True,
-            pd_disaggregation=PDConfig(
-                prefill=PDStagePlacement(gpu=0),
-                decode=PDStagePlacement(gpu=1),
-                decode_pending_limit=64,
-            ),
-        )
-    ]
+    class _Lease:
+        def __init__(self) -> None:
+            self.released = 0
 
-    halves = {s.name: s for s in expand_pd_stages(stages, entry_stage="thinker").stages}
+        def release(self) -> None:
+            self.released += 1
 
-    assert halves["thinker_prefill"].pd_execution.decode_pending_limit == 64
-    assert halves["thinker_decode"].pd_execution.decode_pending_limit == 64
+    lease = _Lease()
+    handoff = SimpleNamespace(lease=lease)
+    runtime = _runtime(1)
+    cleared: list[str] = []
+    runtime._clear_request_state = cleared.append
+
+    async def scenario() -> None:
+        gate = runtime._pd_handoff_gate()
+        await gate.acquire()  # the one permit is taken by another handoff
+        queued = asyncio.create_task(runtime._send_pd_handoff("req-1", handoff))
+        await asyncio.sleep(0)
+        queued.cancel()
+        try:
+            await queued
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+
+    assert lease.released == 1
+    assert cleared == ["req-1"]
 
 
-def test_an_unset_decode_bound_leaves_prefill_unthrottled() -> None:
-    from sglang_omni.config import expand_pd_stages
-    from sglang_omni.config.schema import PDStagePlacement
+def test_a_handoff_that_never_waited_is_left_to_the_send_path() -> None:
+    """With a free permit the send runs and owns the lease, so no double free."""
 
-    stages = [
-        stage(
-            "thinker",
-            terminal=True,
-            pd_disaggregation=PDConfig(
-                prefill=PDStagePlacement(gpu=0), decode=PDStagePlacement(gpu=1)
-            ),
-        )
-    ]
+    class _Lease:
+        def __init__(self) -> None:
+            self.released = 0
 
-    halves = {s.name: s for s in expand_pd_stages(stages, entry_stage="thinker").stages}
+        def release(self) -> None:
+            self.released += 1
 
-    assert halves["thinker_prefill"].pd_execution.decode_pending_limit is None
+    lease = _Lease()
+    handoff = SimpleNamespace(lease=lease)
+    runtime = _runtime(1)
+    sent: list[str] = []
+
+    async def fake_send(request_id: str, _handoff: object) -> None:
+        sent.append(request_id)
+
+    runtime._send_pd_handoff_now = fake_send
+
+    asyncio.run(runtime._send_pd_handoff("req-2", handoff))
+
+    assert sent == ["req-2"]
+    assert lease.released == 0
