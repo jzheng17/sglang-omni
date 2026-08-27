@@ -44,7 +44,7 @@ Decide it, because the default is an unbounded queue and it surfaces as latency 
 
 ### 3. Does the prefill card have room for what moves onto it?
 
-`--pd-stage` moves only the stage it names. The encoders stay where they were, and the CUDA-IPC relay pool appears on the prefill card. Budget for both. This is the most common way a first PD launch fails.
+Splitting a stage moves only that stage. The encoders stay where they were, and the CUDA-IPC relay pool appears on the prefill card. Budget for both. This is the most common way a first PD launch fails.
 
 ### 4. Are you optimizing throughput, or inter-token stability?
 
@@ -78,7 +78,8 @@ The measured gap is larger than the arithmetic predicts: PD's decode card carrie
 sgl-omni serve \
   --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct \
   --config examples/configs/qwen3_omni_pd.yaml \
-  --pd-stage thinker=0:1 \
+  --thinker.pd_disaggregation.prefill.gpu 0 \
+  --thinker.pd_disaggregation.decode.gpu 1 \
   --port 8000
 ```
 
@@ -86,11 +87,21 @@ Pick a config whose `config_cls` is not one of the colocated classes. `Qwen3Omni
 
 Do not combine `--thinker-mem-fraction-static` with a config that already sets `total_gpu_memory_fraction` for the thinker. The two are separate memory contracts and the stage rejects the pair.
 
-`--pd-stage STAGE=PREFILL_GPUS:DECODE_GPUS` splits one stage. Repeat the flag to split more than one. `STAGE` accepts a stage name or a role alias, as `--stage-process` does.
+Declaring `pd_disaggregation` on a stage is what splits it. The two halves are ordinary config paths, so they take the same dotted flags every other per-stage setting does, and they can equally be written in the YAML:
+
+```yaml
+stages:
+  thinker:
+    pd_disaggregation:
+      prefill: {gpu: 0}
+      decode: {gpu: 1}
+```
+
+Both spellings resolve through the same machinery, so the CLI beats the file, a key set twice is reported, and `sgl-omni config explain` says where each value came from.
 
 The flag sets the two server args PD requires, `disable_radix_cache` and `page_size=1`, on both halves. Setting a contradicting value in the stage's `server_args_overrides` is rejected at configuration time and names the argument.
 
-`--pd-stage` moves only the stage it names. Stages that feed it, including the image and audio encoders, keep the GPU they already had. On a two-GPU multimodal deployment the prefill card therefore carries the encoders as well.
+Splitting a stage moves only that stage. Stages that feed it, including the image and audio encoders, keep the GPU they already had. On a two-GPU multimodal deployment the prefill card therefore carries the encoders as well.
 
 ## Both halves on one GPU
 

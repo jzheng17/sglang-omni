@@ -2,10 +2,9 @@
 #
 # Two-GPU prefill/decode profile for the Qwen3-Omni thinker. Launch with
 #
-#   sgl-omni serve --config examples/configs/qwen3_omni_pd.yaml \
-#       --pd-stage thinker=0:1 --port 8000
+#   sgl-omni serve --config examples/configs/qwen3_omni_pd.yaml --port 8000
 #
-# --pd-stage moves only the thinker, so the encoders stay on the GPU they
+# Splitting the thinker moves only the thinker, so the encoders stay on the GPU they
 # already had and the prefill card carries them as well. That card also holds
 # the CUDA-IPC relay pool for mm_aggregate, which a colocated deployment never
 # allocates and which is not reserved until the first payload crosses. The
@@ -20,16 +19,13 @@ model_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
 
 stage_overrides:
   image_encoder:
-    runtime:
-      resources:
-        total_gpu_memory_fraction: 0.025
+    gpu_memory_fraction: 0.025
 
   audio_encoder:
-    runtime:
-      resources:
-        total_gpu_memory_fraction: 0.025
+    gpu_memory_fraction: 0.025
 
   thinker:
-    runtime:
-      resources:
-        total_gpu_memory_fraction: 0.68
+    gpu_memory_fraction: 0.68
+    pd_disaggregation:
+      prefill: {gpu: 0}
+      decode: {gpu: 1}
