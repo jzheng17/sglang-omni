@@ -3,18 +3,35 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 
 from sglang_omni.config import apply_pd_stage_overrides, parse_pd_stage_assignment
+from sglang_omni.config.pd_capability import apply_pd_required_server_args
+from sglang_omni.config.pd_rewrite import expand_pd_stages
 from sglang_omni.config.schema import (
     EndpointsConfig,
     PDConfig,
     PDStagePlacement,
     PipelineConfig,
+    StageConfig,
 )
 from sglang_omni.pipeline.runtime_config import prepare_pipeline_runtime
 from tests.unit_test.fixtures.pipeline_fakes import fake_factory_path
 from tests.unit_test.pipeline.helpers import stage
+
+
+class _EngineStageConfig(StageConfig):
+    """A stage type that may carry an ``engine`` block, as a real one does."""
+
+    engine_stage: ClassVar[bool] = True
+
+
+def _engine_stage(name: str, **kwargs):
+    kwargs.setdefault("factory_path", fake_factory_path("pd_capable_factory"))
+    kwargs.setdefault("process", "pipeline")
+    return _EngineStageConfig(name=name, **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -66,7 +83,7 @@ def _pipeline(tmp_path) -> PipelineConfig:
             stage("pre", next="thinker"),
             stage(
                 "thinker",
-                factory=fake_factory_path("pd_capable_factory"),
+                factory_path=fake_factory_path("pd_capable_factory"),
                 next="post",
             ),
             stage("post", terminal=True),
@@ -150,18 +167,18 @@ def _pd(prefill_gpu: int, decode_gpu: int) -> PDConfig:
 
 
 def _pd_stages(tmp_path, *, factory: str, server_args=None):
-    factory_args = {"server_args_overrides": dict(server_args)} if server_args else {}
+    engine = dict(server_args) if server_args else None
     config = PipelineConfig(
         model_path="dummy",
         name="pd",
         endpoints=EndpointsConfig(base_path=str(tmp_path)),
         entry_stage="thinker",
         stages=[
-            stage(
+            _engine_stage(
                 "thinker",
-                factory=factory,
+                factory_path=factory,
                 terminal=True,
-                factory_args=factory_args,
+                engine=engine,
                 pd_disaggregation=_pd(1, 2),
             )
         ],
@@ -177,7 +194,7 @@ def test_pd_halves_receive_the_server_args_pd_requires(tmp_path) -> None:
     stages = _pd_stages(tmp_path, factory=fake_factory_path("pd_capable_factory"))
 
     for name in ("thinker_prefill", "thinker_decode"):
-        overrides = stages[name].factory_args["server_args_overrides"]
+        overrides = stages[name].engine.overrides()
         for key, required in PD_REQUIRED_SERVER_ARGS.items():
             assert overrides[key] == required, (name, key)
 
@@ -189,14 +206,14 @@ def test_pd_injection_keeps_unrelated_server_args(tmp_path) -> None:
         server_args={"enable_mixed_chunk": False},
     )
 
-    overrides = stages["thinker_decode"].factory_args["server_args_overrides"]
+    overrides = stages["thinker_decode"].engine.overrides()
     assert overrides["enable_mixed_chunk"] is False
     assert overrides["disable_radix_cache"] is True
     assert overrides["page_size"] == 1
 
 
 def test_pd_injection_rejects_a_contradicting_server_arg(tmp_path) -> None:
-    with pytest.raises(ValueError, match="requires page_size=1"):
+    with pytest.raises(ValueError, match="requires engine.page_size=1"):
         _pd_stages(
             tmp_path,
             factory=fake_factory_path("pd_capable_factory"),
@@ -204,14 +221,36 @@ def test_pd_injection_rejects_a_contradicting_server_arg(tmp_path) -> None:
         )
 
 
-def test_pd_injection_skips_a_factory_that_cannot_receive_it(tmp_path) -> None:
-    """A strict signature must not be handed a keyword it does not declare."""
-    stages = _pd_stages(
-        tmp_path, factory=fake_factory_path("strict_pd_capable_factory")
+def test_a_non_engine_stage_gets_no_engine_block(tmp_path) -> None:
+    """The engine block only exists on stage types that declare engine_stage."""
+    config = PipelineConfig(
+        model_path="dummy",
+        name="pd",
+        endpoints=EndpointsConfig(base_path=str(tmp_path)),
+        entry_stage="thinker",
+        stages=[
+            stage(
+                "thinker",
+                factory_path=fake_factory_path("pd_capable_factory"),
+                terminal=True,
+                pd_disaggregation=PDConfig(
+                    prefill=PDStagePlacement(gpu=0),
+                    decode=PDStagePlacement(gpu=1),
+                ),
+            )
+        ],
     )
+    halves = {
+        s.name: s
+        for s in apply_pd_required_server_args(
+            expand_pd_stages(
+                list(config.stages), entry_stage=config.resolved_entry_stage
+            ).stages
+        )
+    }
 
     for name in ("thinker_prefill", "thinker_decode"):
-        assert "server_args_overrides" not in stages[name].factory_args
+        assert halves[name].engine is None
 
 
 def test_non_pd_pipeline_gets_no_server_args_injected(tmp_path) -> None:
@@ -224,7 +263,10 @@ def test_non_pd_pipeline_gets_no_server_args_injected(tmp_path) -> None:
     prep = prepare_pipeline_runtime(config)
     with prep.runtime_dir:
         for unchanged in prep.stages_cfg:
-            assert "server_args_overrides" not in unchanged.factory_args
+            assert (
+                unchanged.engine is None
+                or "page_size" not in unchanged.engine.overrides()
+            )
 
 
 def test_a_half_share_reaches_the_placement(tmp_path) -> None:
