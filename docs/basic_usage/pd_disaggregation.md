@@ -117,6 +117,19 @@ pd_disaggregation:
 
 Use that share rather than `mem_fraction_static` when the halves share a card. `total_gpu_memory_fraction` is a fraction of total physical memory, so it does not depend on which half loads first. `mem_fraction_static` is computed against memory free at load time, and the two halves race for one startup lock: measured on one H200, whichever half won the lock sized itself to 780,987 KV tokens and the other failed to start. With the share form both halves sized to 21,502 KV tokens under either lock order.
 
+One declared share does not give both halves the same KV budget. With `share_weights` on, the half that publishes the weights holds its copy inside its own share, and the half that adopts them releases its copy before its pool is sized. Measured on one H200 with both halves at 0.47: the publisher received 22,547 KV tokens and the adopter 643,731. The publisher is whichever half declares the larger share, so the asymmetry follows the declaration. Size the publishing half as `what you want for KV` plus the weights.
+
+Sharing a card trades first-token latency against inter-token latency, and the direction is worth knowing before you choose it. Measured against a colocated replica on the same card, closed-loop at concurrency 8, 32 output tokens:
+
+| prompt tokens | first token, p50 | between tokens, p50 |
+| ---: | --- | --- |
+| 256 | 5.4x sooner | 2.4x longer |
+| 1024 | 4.4x sooner | 2.5x longer |
+| 4096 | 2.6x sooner | 2.0x longer |
+| 8128 | no gain | 1.4x shorter |
+
+So the split is worth it where a fast first token matters and a slightly slower stream does not — interactive text, short prompts. It is not worth it where the stream's cadence is the product, and at 8128 tokens it stops buying the first-token gain at all.
+
 Prefer the share over an absolute `max_total_tokens` here. `max_total_tokens` is applied as a minimum against the profiled capacity, so a cap larger than what the later-loading half can profile stops binding on that half and the pair silently reverts to order-dependent sizing.
 
 ## Budget for the relay pool
