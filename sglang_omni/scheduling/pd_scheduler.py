@@ -15,6 +15,7 @@ from sglang.srt.managers.scheduler import Scheduler as _Upstream
 from sglang_omni.comm import KVPageTransfer
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler, _detach_request_data
+from sglang_omni.scheduling.pd_alloc_lock import LockedKVAllocator
 from sglang_omni.scheduling.pd_utils import (
     DecodeKVReceiver,
     DecodeRequestPoolExhausted,
@@ -193,6 +194,8 @@ class OmniDecodeScheduler(OmniScheduler):
         super().__init__(*args, **kwargs)
         _validate_pd_runtime(self)
 
+        _serialize_kv_allocation(self)
+
         pool_id = f"{stage_name}:kv"
         pool = build_kv_pool(
             self.token_to_kv_pool_allocator.get_kvcache(),
@@ -280,6 +283,61 @@ class OmniDecodeScheduler(OmniScheduler):
                 except queue.Empty:
                     return
                 self.token_to_kv_pool_allocator.free(admission.allocation.slots)
+
+
+# Note (Audrey Zheng): every object that allocates or frees from one KV pool.
+# `bootstrap.py` hands the same allocator to `create_tree_cache` before this
+# scheduler exists, so rebinding only our own attribute would leave the tree
+# cache calling an unwrapped alias.
+_KV_ALLOCATOR_HOLDERS = ("tree_cache",)
+
+
+def _serialize_kv_allocation(scheduler: OmniDecodeScheduler) -> None:
+    """Give every holder of the KV allocator the same locked object.
+
+    A Decode half allocates from two threads: this scheduler for decode steps
+    and the comm event loop through `DecodeKVReceiver.reserve`. Upstream's
+    `alloc` reads `free_pages`, slices it and writes the remainder back with no
+    lock, which is correct while one thread owns the allocator and hands the
+    same slots to both callers when two do.
+
+    One lock only helps if every caller goes through it, so the wrapper has to
+    reach the tree cache as well as this scheduler.
+
+    Wrapping here rather than in `bootstrap.py` is deliberate: upstream's
+    `SWAChunkCache.__init__` asserts the allocator's concrete type, and a proxy
+    handed to that constructor would fail the assert for models that use it.
+    Wrapping at construction rather than after it means no request has been
+    served through an unwrapped alias.
+    """
+    locked = LockedKVAllocator(scheduler.token_to_kv_pool_allocator)
+    scheduler.token_to_kv_pool_allocator = locked
+    for name in _KV_ALLOCATOR_HOLDERS:
+        holder = getattr(scheduler, name, None)
+        if holder is None:
+            continue
+        if not hasattr(holder, "token_to_kv_pool_allocator"):
+            raise RuntimeError(
+                f"PD decode half: {name} has no token_to_kv_pool_allocator to "
+                "rebind, so its allocations would bypass the lock"
+            )
+        holder.token_to_kv_pool_allocator = locked
+
+
+def kv_allocator_holders(scheduler: OmniDecodeScheduler) -> dict[str, Any]:
+    """Every allocator reference the scheduler can reach, by holder name.
+
+    A test asserts these are one object. That is what catches a new holder
+    appearing between the allocator's creation and this scheduler's.
+    """
+    found: dict[str, Any] = {
+        "scheduler": scheduler.__dict__.get("token_to_kv_pool_allocator")
+    }
+    for name in _KV_ALLOCATOR_HOLDERS:
+        holder = getattr(scheduler, name, None)
+        if holder is not None:
+            found[name] = getattr(holder, "token_to_kv_pool_allocator", None)
+    return found
 
 
 def _validate_pd_runtime(scheduler: OmniScheduler) -> None:
