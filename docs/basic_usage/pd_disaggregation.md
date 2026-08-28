@@ -130,6 +130,8 @@ Sharing a card trades first-token latency against inter-token latency, and the d
 
 So the split is worth it where a fast first token matters and a slightly slower stream does not — interactive text, short prompts. It is not worth it where the stream's cadence is the product, and at 8128 tokens it stops buying the first-token gain at all.
 
+Rely on the direction rather than the multiplier. Each row is one paired run, and repeating an identical configuration on one H200 moved throughput by 81% and first-token time by 95% between runs, driven by what else the host was doing. Throughput on a shared card is not measurable this way at all, which is why there is no throughput column here.
+
 Prefer the share over an absolute `max_total_tokens` here. `max_total_tokens` is applied as a minimum against the profiled capacity, so a cap larger than what the later-loading half can profile stops binding on that half and the pair silently reverts to order-dependent sizing.
 
 ## Budget for the relay pool
