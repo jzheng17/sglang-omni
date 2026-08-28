@@ -16,6 +16,7 @@ from sglang_omni.comm import KVPageTransfer
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler, _detach_request_data
 from sglang_omni.scheduling.pd_alloc_lock import LockedKVAllocator
+from sglang_omni.scheduling.pd_decode_selection import select_decode_stage
 from sglang_omni.scheduling.pd_utils import (
     DecodeKVReceiver,
     DecodeRequestPoolExhausted,
@@ -68,6 +69,7 @@ class OmniPrefillScheduler(OmniScheduler):
         *args,
         stage_name: str,
         partner_stage: str,
+        decode_targets: tuple[str, ...] = (),
         state_builder: Callable = default_state_builder,
         **kwargs,
     ) -> None:
@@ -76,6 +78,12 @@ class OmniPrefillScheduler(OmniScheduler):
 
         self._pd_stage_name = stage_name
         self._pd_partner_stage = partner_stage
+        # Note (Audrey Zheng): every Decode half this Prefill may send to.
+        # Sorted, because the KV send is rank-addressed: two Prefill ranks that
+        # disagree on the order would split one request's pages across
+        # different Decode halves, and nothing in the transfer path checks for
+        # it. Empty falls back to `partner`, which is 1:1.
+        self._pd_decode_targets = tuple(sorted(decode_targets)) or (partner_stage,)
         self._pd_state_builder = state_builder
         self._pd_pool_id = f"{stage_name}:kv"
         pool = build_kv_pool(
@@ -83,6 +91,15 @@ class OmniPrefillScheduler(OmniScheduler):
             pool_id=self._pd_pool_id,
         )
         self.kv_registrations = ((pool, None),)
+
+    def _resolve_decode_stage(self, req: Any) -> str:
+        """Return the Decode stage that receives this request's KV.
+
+        The choice lives in `select_decode_stage`, which takes only values
+        every Prefill rank sees identically. That constraint is not cosmetic --
+        read that function before changing the policy.
+        """
+        return select_decode_stage(self._pd_decode_targets, str(req.rid))
 
     def get_next_batch_to_run(self):
         if (
@@ -140,6 +157,7 @@ class OmniPrefillScheduler(OmniScheduler):
                 # Abort and invalid-token failures still terminalize locally.
                 continue
             try:
+                decode_stage = self._resolve_decode_stage(req)
                 transfer_id = f"{req.rid}:pd:{uuid4().hex}"
                 continuation = continuation_from_req(
                     req, transfer_id, self._pd_state_builder
@@ -148,11 +166,11 @@ class OmniPrefillScheduler(OmniScheduler):
                     request_id=req.rid,
                     transfer_id=transfer_id,
                     source_pool_id=self._pd_pool_id,
-                    target_pool_id=f"{self._pd_partner_stage}:kv",
+                    target_pool_id=f"{decode_stage}:kv",
                     source_page_indices=request_page_indices(
                         self.req_to_token_pool, req
                     ),
-                    to_stage=self._pd_partner_stage,
+                    to_stage=decode_stage,
                     metadata={"decode_continuation": continuation.encode()},
                     lease=SGLangKVLease(req, self.tree_cache),
                 )
@@ -184,9 +202,12 @@ class OmniDecodeScheduler(OmniScheduler):
         state_restorer: Callable = default_state_restorer,
         allowed_resume_schemas: frozenset[str] = frozenset(),
         partner_stage: str | None = None,
+        decode_targets: tuple[str, ...] = (),
         **kwargs,
     ) -> None:
-        del partner_stage
+        # The compiler hands both halves the same kwargs. A Decode half has no
+        # peer to choose, so it drops the two that describe one.
+        del partner_stage, decode_targets
         self._pd_admissions = queue.SimpleQueue()
         self._pd_deferred_admission = None
         self._pd_admission_lock = threading.Lock()
