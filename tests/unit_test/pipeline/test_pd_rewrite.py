@@ -351,3 +351,44 @@ def test_an_unsplit_budget_still_reaches_both_halves() -> None:
 
     assert halves["thinker_prefill"].gpu_memory_fraction == 0.8
     assert halves["thinker_decode"].gpu_memory_fraction == 0.8
+
+
+@pytest.mark.parametrize(
+    "engine,message",
+    [
+        ({"page_size": 32}, "requires 1"),
+        ({"disable_radix_cache": False}, "requires True"),
+    ],
+)
+def test_a_pd_stage_is_rejected_for_what_the_runtime_cannot_do(engine, message) -> None:
+    """The scheduler refuses these in its constructor, after the model loads."""
+    from sglang_omni.config.pd_capability import validate_pd_engine_args
+
+    logical = stage(
+        "thinker",
+        terminal=True,
+        pd_disaggregation=PDConfig(
+            prefill=PDStagePlacement(gpu=0, engine=engine),
+            decode=PDStagePlacement(gpu=1),
+        ),
+    )
+    expansion = expand_pd_stages([logical], entry_stage="thinker")
+
+    with pytest.raises(ValueError, match=message):
+        validate_pd_engine_args(expansion.stages)
+
+
+def test_a_supported_engine_argument_passes() -> None:
+    from sglang_omni.config.pd_capability import validate_pd_engine_args
+
+    logical = stage(
+        "thinker",
+        terminal=True,
+        pd_disaggregation=PDConfig(
+            prefill=PDStagePlacement(gpu=0, engine={"page_size": 1}),
+            decode=PDStagePlacement(gpu=1, engine={"max_running_requests": 64}),
+        ),
+    )
+    expansion = expand_pd_stages([logical], entry_stage="thinker")
+
+    validate_pd_engine_args(expansion.stages)
