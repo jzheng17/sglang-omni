@@ -164,25 +164,29 @@ def test_a_receiver_built_after_the_wrap_gets_the_locked_allocator() -> None:
     assert isinstance(receiver._allocator, LockedKVAllocator)
 
 
-def test_a_lease_release_does_not_touch_the_tree_on_the_calling_thread() -> None:
+def test_a_lease_release_does_not_touch_the_tree_on_the_calling_thread(
+    monkeypatch,
+) -> None:
     """release runs on the comm loop; the tree belongs to the scheduler."""
     import queue as _queue
 
-    from sglang_omni.scheduling.pd_utils import SGLangKVLease, drain_due_releases
+    import sglang.srt.mem_cache.common as common
 
-    released: list[object] = []
+    from sglang_omni.scheduling.pd_utils import SGLangKVLease
 
-    class _Tree:
-        pass
+    freed: list[object] = []
+    monkeypatch.setattr(
+        common, "release_kv_cache", lambda req, cache: freed.append(req)
+    )
 
     req = object()
     due: _queue.SimpleQueue = _queue.SimpleQueue()
-    lease = SGLangKVLease(req, _Tree(), due)
+    lease = SGLangKVLease(req, object(), due)
 
     lease.release()
 
-    assert released == []  # nothing freed yet
-    assert due.qsize() == 1
+    assert freed == []
+    assert due.get_nowait() is req
 
 
 def test_a_lease_releases_once_however_many_times_it_is_called() -> None:
