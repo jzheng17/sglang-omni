@@ -253,50 +253,47 @@ def test_one_failed_release_does_not_strand_the_rest(monkeypatch) -> None:
     assert freed == ["good"]
 
 
-def test_an_unreplicated_decode_half_is_its_own_only_target() -> None:
-    from sglang_omni.scheduling.pd_utils import expand_decode_targets
+def _prefill_stage(topology, bindings):
+    """A Stage with only what the KV send path reads."""
+    from sglang_omni.pipeline.stage.runtime import Stage
 
-    endpoints = {"thinker_prefill": ("a",), "thinker_decode": ("b",)}
+    stage = Stage.__new__(Stage)
+    stage.name = "thinker_prefill"
+    stage._replica_topology = topology
+    stage._replica_bindings = bindings
+    return stage
 
-    assert expand_decode_targets(endpoints, "thinker_decode") == ("thinker_decode",)
+
+def test_an_unreplicated_decode_target_is_sent_to_unchanged() -> None:
+    from sglang_omni.pipeline.replicas import ReplicaTopology
+
+    stage = _prefill_stage(ReplicaTopology(replicas={}), {})
+
+    assert stage._resolve_target_instance("req-1", "thinker_decode") == "thinker_decode"
 
 
-def test_every_replica_becomes_a_target() -> None:
-    from sglang_omni.scheduling.pd_utils import expand_decode_targets
+def test_a_replicated_decode_target_follows_the_admission_binding() -> None:
+    """The coordinator chose once; the send must not choose again."""
+    from sglang_omni.pipeline.replicas import ReplicaTopology
 
-    endpoints = {
-        "thinker_prefill": ("a",),
-        "thinker_decode@r0": ("b",),
-        "thinker_decode@r1": ("c",),
-    }
+    topology = ReplicaTopology(
+        replicas={"thinker_decode": ("thinker_decode@r0", "thinker_decode@r1")}
+    )
+    stage = _prefill_stage(topology, {"req-1": {"thinker_decode": 1}})
 
-    assert expand_decode_targets(endpoints, "thinker_decode") == (
-        "thinker_decode@r0",
-        "thinker_decode@r1",
+    assert (
+        stage._resolve_target_instance("req-1", "thinker_decode") == "thinker_decode@r1"
     )
 
 
-def test_the_order_does_not_depend_on_how_endpoints_were_discovered() -> None:
-    """Two Prefill ranks disagreeing on order would split a request's pages."""
-    from sglang_omni.scheduling.pd_utils import expand_decode_targets
+def test_a_replicated_target_without_a_binding_is_an_error() -> None:
+    """Guessing here would send KV where the request is not expected."""
+    from sglang_omni.pipeline.replicas import ReplicaTopology
 
-    forward = {"thinker_decode@r0": ("b",), "thinker_decode@r1": ("c",)}
-    reverse = {"thinker_decode@r1": ("c",), "thinker_decode@r0": ("b",)}
-
-    assert expand_decode_targets(forward, "thinker_decode") == expand_decode_targets(
-        reverse, "thinker_decode"
+    topology = ReplicaTopology(
+        replicas={"thinker_decode": ("thinker_decode@r0", "thinker_decode@r1")}
     )
+    stage = _prefill_stage(topology, {})
 
-
-def test_a_stage_that_merely_shares_a_prefix_is_not_a_target() -> None:
-    from sglang_omni.scheduling.pd_utils import expand_decode_targets
-
-    endpoints = {"thinker_decode": ("b",), "thinker_decoder_aux": ("c",)}
-
-    assert expand_decode_targets(endpoints, "thinker_decode") == ("thinker_decode",)
-
-
-def test_no_endpoints_yet_falls_back_to_the_compiler_name() -> None:
-    from sglang_omni.scheduling.pd_utils import expand_decode_targets
-
-    assert expand_decode_targets({}, "thinker_decode") == ("thinker_decode",)
+    with pytest.raises(RuntimeError, match="no replica binding"):
+        stage._resolve_target_instance("req-1", "thinker_decode")
