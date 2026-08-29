@@ -120,6 +120,34 @@ StateBuilder = Callable[[Any], tuple[dict[str, Any], dict[str, Any] | None, list
 StateRestorer = Callable[[Any, SGLangARRequestData, dict[str, Any] | None], None]
 
 
+def expand_decode_targets(
+    rank_endpoints: dict[str, tuple[str, ...]],
+    partner: str,
+) -> tuple[str, ...]:
+    """Every physical Decode half behind the logical ``partner`` name.
+
+    The compiler names one Decode stage, because at compile time that is all
+    there is. Replicating that process happens afterwards, in the pipeline
+    layer, and produces ``thinker_decode@r0``, ``thinker_decode@r1`` and so
+    on. ``rank_endpoints`` is keyed by physical stage name and is built after
+    that expansion, so it is the first place the real set is visible.
+
+    Sorted, because the KV send is rank-addressed and every Prefill rank must
+    derive the same order. Dictionary order is insertion order, which depends
+    on how endpoints were discovered.
+
+    Matching is exact-or-``@``-prefixed so a separate stage that merely starts
+    with the same characters -- ``thinker_decoder_aux`` -- is not swept in.
+    """
+    if not rank_endpoints:
+        return (partner,)
+    prefix = f"{partner}@"
+    found = [
+        name for name in rank_endpoints if name == partner or name.startswith(prefix)
+    ]
+    return tuple(sorted(found)) or (partner,)
+
+
 def default_state_builder(
     req: Any,
 ) -> tuple[dict[str, Any], dict[str, Any] | None, list[int]]:

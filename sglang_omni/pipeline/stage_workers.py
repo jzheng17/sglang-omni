@@ -27,6 +27,7 @@ from sglang_omni.pipeline.stage.runtime import Stage
 from sglang_omni.pipeline.stage.stream_queue import StreamQueue
 from sglang_omni.pipeline.tp_control import TPFollowerControlPlane, TPLeaderFanout
 from sglang_omni.platforms import current_platform, get_platform_spec
+from sglang_omni.scheduling.pd_utils import expand_decode_targets
 from sglang_omni.utils.gpu_compat import (
     apply_gpu_compat_env_defaults,
     get_gpu_compat_env_defaults,
@@ -842,7 +843,12 @@ def _construct_scheduler(
         factory_args["scheduler_kwargs"] = {
             "stage_name": spec.stage_name,
             "partner_stage": spec.pd_execution.partner,
-            "decode_targets": spec.pd_execution.decode_targets,
+            # The compiler recorded one Decode name. If that process was
+            # replicated, rank_endpoints is the first place the expanded set
+            # is visible, and it exists by the time the scheduler is built.
+            "decode_targets": expand_decode_targets(
+                spec.rank_endpoints, spec.pd_execution.partner
+            ),
         }
 
     def construct() -> Any:

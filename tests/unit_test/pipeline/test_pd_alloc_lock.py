@@ -251,3 +251,52 @@ def test_one_failed_release_does_not_strand_the_rest(monkeypatch) -> None:
 
     assert pd_utils.drain_due_releases(due, object()) == 2
     assert freed == ["good"]
+
+
+def test_an_unreplicated_decode_half_is_its_own_only_target() -> None:
+    from sglang_omni.scheduling.pd_utils import expand_decode_targets
+
+    endpoints = {"thinker_prefill": ("a",), "thinker_decode": ("b",)}
+
+    assert expand_decode_targets(endpoints, "thinker_decode") == ("thinker_decode",)
+
+
+def test_every_replica_becomes_a_target() -> None:
+    from sglang_omni.scheduling.pd_utils import expand_decode_targets
+
+    endpoints = {
+        "thinker_prefill": ("a",),
+        "thinker_decode@r0": ("b",),
+        "thinker_decode@r1": ("c",),
+    }
+
+    assert expand_decode_targets(endpoints, "thinker_decode") == (
+        "thinker_decode@r0",
+        "thinker_decode@r1",
+    )
+
+
+def test_the_order_does_not_depend_on_how_endpoints_were_discovered() -> None:
+    """Two Prefill ranks disagreeing on order would split a request's pages."""
+    from sglang_omni.scheduling.pd_utils import expand_decode_targets
+
+    forward = {"thinker_decode@r0": ("b",), "thinker_decode@r1": ("c",)}
+    reverse = {"thinker_decode@r1": ("c",), "thinker_decode@r0": ("b",)}
+
+    assert expand_decode_targets(forward, "thinker_decode") == expand_decode_targets(
+        reverse, "thinker_decode"
+    )
+
+
+def test_a_stage_that_merely_shares_a_prefix_is_not_a_target() -> None:
+    from sglang_omni.scheduling.pd_utils import expand_decode_targets
+
+    endpoints = {"thinker_decode": ("b",), "thinker_decoder_aux": ("c",)}
+
+    assert expand_decode_targets(endpoints, "thinker_decode") == ("thinker_decode",)
+
+
+def test_no_endpoints_yet_falls_back_to_the_compiler_name() -> None:
+    from sglang_omni.scheduling.pd_utils import expand_decode_targets
+
+    assert expand_decode_targets({}, "thinker_decode") == ("thinker_decode",)
