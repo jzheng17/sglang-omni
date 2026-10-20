@@ -79,6 +79,9 @@ def restore_state(
     request: Req,
     request_data: SGLangARRequestData,
     resume: dict[str, object] | None,
+    *,
+    frame_width: int | None = None,
+    codebook_size: int | None = None,
 ) -> None:
     if not isinstance(resume, dict) or resume.get("schema") != RESUME_SCHEMA:
         raise ValueError("unsupported Drama 3 PD resume schema")
@@ -89,6 +92,16 @@ def restore_state(
     frame_rows = validate_frame_history(
         request, resume["frame_rows"], resume["prompt_row_count"]
     )
+    if frame_width is not None and any(len(row) != frame_width for row in frame_rows):
+        raise ValueError("Drama 3 PD frame width differs from the model")
+    elif any(row[0] >= request.vocab_size for row in frame_rows):
+        raise ValueError("Drama 3 PD main token exceeds the model vocabulary")
+    elif codebook_size is not None and any(
+        token >= codebook_size for row in frame_rows for token in row[1:]
+    ):
+        raise ValueError("Drama 3 PD codebook token exceeds the model vocabulary")
+    else:
+        pass
     request.omni_data = Drama3RequestData(
         **{
             field.name: getattr(request_data, field.name)
@@ -97,4 +110,5 @@ def restore_state(
         frame_rows=frame_rows,
         prompt_row_count=resume["prompt_row_count"],
         streamed_frame_count=0,
+        pd_state_pending=True,
     )

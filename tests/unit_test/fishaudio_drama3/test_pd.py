@@ -3,6 +3,8 @@
 
 from array import array
 from dataclasses import fields
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -10,6 +12,8 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.sampling.sampling_params import SamplingParams
 
+from sglang_omni.models.fishaudio_drama3 import engine_builder
+from sglang_omni.models.fishaudio_drama3.engine_builder import Drama3EngineBuilder
 from sglang_omni.models.fishaudio_drama3.pd import build_state, restore_state
 from sglang_omni.models.fishaudio_drama3.request_builders import (
     Drama3RequestData,
@@ -114,3 +118,55 @@ def test_restore_rejects_incomplete_or_inconsistent_frames(bad_rows):
     )
     with pytest.raises(ValueError):
         restore_state(source, base, resume)
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+@pytest.mark.parametrize("async_decode", [False, True])
+def test_pd_builder_keeps_runner_and_async_settings(monkeypatch, role, async_decode):
+    prefill_constructor = Mock()
+    decode_constructor = Mock()
+    monkeypatch.setattr(engine_builder, "OmniPrefillScheduler", prefill_constructor)
+    monkeypatch.setattr(engine_builder, "OmniDecodeScheduler", decode_constructor)
+    builder = Drama3EngineBuilder(
+        context_length=64,
+        max_running_requests=2,
+        pd_role=role,
+        pd_stage_name="tts_engine" if role == "prefill" else "tts_decode",
+        pd_partner_stage="tts_decode" if role == "prefill" else None,
+    )
+    runner = object()
+    streamer = object()
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            model=SimpleNamespace(
+                config=SimpleNamespace(
+                    audio_decoder_config=SimpleNamespace(
+                        num_codebooks=10, vocab_size=32
+                    )
+                )
+            )
+        )
+    )
+    builder.make_scheduler(
+        model_worker=worker,
+        model_runner=runner,
+        extra_scheduler_kwargs={
+            "enable_async_decode": async_decode,
+            "stream_output_builder": streamer,
+        },
+    )
+    constructor = prefill_constructor if role == "prefill" else decode_constructor
+    arguments = constructor.call_args.kwargs
+    assert arguments["model_runner"] is runner
+    assert arguments["tp_worker"] is worker
+    assert arguments["enable_async_decode"] is async_decode
+    if role == "prefill":
+        assert arguments["stream_output_builder"] is None
+        assert arguments["partner_stage"] == "tts_decode"
+    else:
+        assert arguments["stream_output_builder"] is streamer
+        assert arguments["emit_transferred_token"] is True
+        assert arguments["state_restorer"].keywords == {
+            "frame_width": 11,
+            "codebook_size": 32,
+        }
